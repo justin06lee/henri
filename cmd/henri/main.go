@@ -16,13 +16,16 @@ import (
 	"syscall"
 	"time"
 
+	"bufio"
+
 	"github.com/justin06lee/henri/internal/clipboard"
 	"github.com/justin06lee/henri/internal/config"
+	"github.com/justin06lee/henri/internal/mnemonic"
 	"github.com/justin06lee/henri/internal/node"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.1.0"
+var version = "0.2.0"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
@@ -54,6 +57,8 @@ func run(args []string) error {
 		return cmdPeers(args[1:])
 	case "send", "push":
 		return cmdSend()
+	case "leave", "forget":
+		return cmdLeave(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("henri " + version)
 		return nil
@@ -72,12 +77,13 @@ func usage() {
 usage: henri <command> [flags]
 
   init            start a new clipboard group on this device
-  join <code>     join an existing group using its join code
-  code            print this group's join code
+  join <words>    join an existing group using its recovery phrase
+  code            print this group's recovery phrase
   daemon          run the sync daemon in the foreground
   status          show what the local daemon is doing
   peers           list known devices; ` + "`peers add|rm <host:port>`" + ` to edit
   send            re-send the current clipboard to the group
+  leave           remove this device's config and leave the group
   version         print the version
 
 Run 'henri <command> -h' for the flags a command accepts.
@@ -91,9 +97,14 @@ func cmdInit(args []string) error {
 	name := fs.String("name", defaultDeviceName(), "name for this device")
 	port := fs.Int("port", config.DefaultListenPort, "TCP port to receive clipboard updates on")
 	discovery := fs.Bool("discovery", true, "find other devices on the LAN automatically")
+	words := fs.Int("words", 12, "length of the recovery phrase (12, 15, 18, 21 or 24)")
 	force := fs.Bool("force", false, "overwrite an existing config")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	bits, ok := mnemonic.EntropyBitsFor(*words)
+	if !ok {
+		return fmt.Errorf("-words must be 12, 15, 18, 21 or 24, not %d", *words)
 	}
 
 	path, err := config.Path()
@@ -104,7 +115,7 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("a config already exists at %s (use -force to replace it, which leaves this device's current group)", path)
 	}
 
-	cfg, err := config.New(*name)
+	cfg, err := config.New(*name, bits)
 	if err != nil {
 		return err
 	}
@@ -114,17 +125,16 @@ func cmdInit(args []string) error {
 		return err
 	}
 
-	code, err := joinCode(cfg)
-	if err != nil {
-		return err
-	}
 	fmt.Printf("Started a new clipboard group.\n\n")
 	fmt.Printf("  config   %s\n", path)
 	fmt.Printf("  device   %s\n", cfg.DeviceName)
 	fmt.Printf("  group    %s\n\n", cfg.GroupID)
-	fmt.Printf("Run this on every other device to join:\n\n  henri join %s\n\n", code)
-	fmt.Printf("That code is the group's secret key. Anyone holding it can read\n")
-	fmt.Printf("everything you copy, so send it over something you trust.\n\n")
+	fmt.Printf("Your recovery phrase — these %d words are the whole secret:\n\n", *words)
+	fmt.Print(formatPhrase(cfg.Phrase))
+	fmt.Printf("\nOn every other device, run:\n\n  henri join %s\n\n", cfg.Phrase)
+	fmt.Printf("Anyone who has those words can read everything you copy. Read them out\n")
+	fmt.Printf("loud or type them in by hand — don't paste them through anything you\n")
+	fmt.Printf("don't control.\n\n")
 	fmt.Printf("Then start the daemon on each device:  henri daemon\n")
 	if err := clipboard.Available(); err != nil {
 		fmt.Printf("\nHeads up: %v\n", err)
@@ -143,8 +153,8 @@ func cmdJoin(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("usage: henri join <code>")
+	if fs.NArg() == 0 {
+		return errors.New("usage: henri join <word> <word> ...  (the words `henri init` printed)")
 	}
 
 	path, err := config.Path()
@@ -155,21 +165,21 @@ func cmdJoin(args []string) error {
 		return fmt.Errorf("a config already exists at %s (use -force to replace it)", path)
 	}
 
-	cfg, err := parseJoinCode(fs.Arg(0))
+	// The words can arrive as separate arguments or as one quoted string, and
+	// older releases handed out a base64 join code instead.
+	input := strings.Join(fs.Args(), " ")
+	var cfg *config.Config
+	if strings.HasPrefix(strings.TrimSpace(input), legacyCodePrefix) {
+		cfg, err = joinLegacyCode(input, *name)
+	} else {
+		cfg, err = config.Join(input, *name)
+	}
 	if err != nil {
 		return err
 	}
-	// A new device ID: the group is shared, the identity is not.
-	fresh, err := config.New(*name)
-	if err != nil {
-		return err
-	}
-	cfg.DeviceID = fresh.DeviceID
-	cfg.DeviceName = *name
+
 	cfg.ListenPort = *port
 	cfg.Discovery = *discovery
-	cfg.PollMillis = config.DefaultPollMillis
-	cfg.MaxBytes = config.DefaultMaxBytes
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -191,43 +201,65 @@ func cmdCode() error {
 	if err != nil {
 		return err
 	}
-	code, err := joinCode(cfg)
-	if err != nil {
-		return err
+	if cfg.Phrase == "" {
+		return errors.New("this config was made before recovery phrases existed, so there is no " +
+			"phrase to show; re-run `henri init` on one device and `henri join` on the rest to move over")
 	}
-	fmt.Println(code)
+	fmt.Print(formatPhrase(cfg.Phrase))
+	fmt.Printf("\n  henri join %s\n", cfg.Phrase)
 	return nil
 }
 
-// joinCodePayload is the minimum another device needs to enter the group.
-type joinCodePayload struct {
+// formatPhrase lays the words out numbered, four to a row, so they are easy to
+// read off one screen while typing them into another.
+func formatPhrase(phrase string) string {
+	w := mnemonic.Split(phrase)
+	var b strings.Builder
+	for i := 0; i < len(w); i += 4 {
+		b.WriteString("  ")
+		for j := i; j < i+4 && j < len(w); j++ {
+			b.WriteString(fmt.Sprintf("%3d. %-11s", j+1, w[j]))
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// legacyCodePrefix tagged the base64 join codes henri handed out before
+// recovery phrases. Still accepted so groups created then keep working.
+const legacyCodePrefix = "henri1:"
+
+type legacyCode struct {
 	G string `json:"g"`
 	K string `json:"k"`
 	P int    `json:"p,omitempty"`
 }
 
-func joinCode(cfg *config.Config) (string, error) {
-	raw, err := json.Marshal(joinCodePayload{G: cfg.GroupID, K: cfg.Key, P: cfg.ListenPort})
-	if err != nil {
-		return "", err
-	}
-	return codePrefix + base64.RawURLEncoding.EncodeToString(raw), nil
-}
-
-func parseJoinCode(code string) (*config.Config, error) {
+func joinLegacyCode(code, deviceName string) (*config.Config, error) {
 	code = strings.TrimSpace(code)
-	if !strings.HasPrefix(code, codePrefix) {
-		return nil, fmt.Errorf("that does not look like a join code (it should start with %q)", codePrefix)
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(code, codePrefix))
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(code, legacyCodePrefix))
 	if err != nil {
-		return nil, fmt.Errorf("the join code is damaged: %w", err)
+		return nil, fmt.Errorf("that join code is damaged: %w", err)
 	}
-	var p joinCodePayload
+	var p legacyCode
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return nil, fmt.Errorf("the join code is damaged: %w", err)
+		return nil, fmt.Errorf("that join code is damaged: %w", err)
 	}
-	return &config.Config{GroupID: p.G, Key: p.K, Discovery: true}, nil
+	device, err := config.NewDeviceID()
+	if err != nil {
+		return nil, err
+	}
+	return &config.Config{
+		GroupID:       p.G,
+		Key:           p.K,
+		DeviceID:      device,
+		DeviceName:    deviceName,
+		ListenPort:    config.DefaultListenPort,
+		DiscoveryPort: config.DefaultDiscoveryPort,
+		Discovery:     true,
+		PollMillis:    config.DefaultPollMillis,
+		MaxBytes:      config.DefaultMaxBytes,
+	}, nil
 }
 
 // --- daemon ----------------------------------------------------------------
@@ -424,6 +456,84 @@ func cmdSend() error {
 	}
 	fmt.Println("Sent the current clipboard to the group.")
 	return nil
+}
+
+// --- leave -----------------------------------------------------------------
+
+func cmdLeave(args []string) error {
+	fs := flag.NewFlagSet("leave", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	force := fs.Bool("force", false, "remove the config even while the daemon is running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	path, err := config.Path()
+	if err != nil {
+		return err
+	}
+
+	// A running daemon already holds the key in memory and would happily keep
+	// syncing after the file was gone, which looks like henri ignoring you.
+	if _, qerr := node.Query(cfg, node.KindStatus); qerr == nil && !*force {
+		return errors.New("the daemon is still running, and it would keep syncing after the config was removed.\n" +
+			"       Stop it first (Ctrl-C, `systemctl --user stop henri`, or `launchctl unload ...`),\n" +
+			"       or re-run with -force if you know it is about to stop")
+	}
+
+	fmt.Printf("This removes %s\n\n", path)
+	fmt.Printf("  device   %s\n", cfg.DeviceName)
+	fmt.Printf("  group    %s\n\n", cfg.GroupID)
+
+	if cfg.Phrase != "" {
+		fmt.Printf("Only this device leaves. Your other devices carry on without it, and\n")
+		fmt.Printf("you can rejoin any time with the same phrase.\n\n")
+		fmt.Printf("If you have not written the phrase down, stop and run `henri code` first.\n\n")
+	} else {
+		fmt.Printf("This config has no recovery phrase, so there is no way back into this\n")
+		fmt.Printf("group from this device once it is gone.\n\n")
+	}
+
+	if !*yes {
+		ok, err := confirm("Remove it?")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("Left it alone.")
+			return nil
+		}
+	}
+
+	removed, err := config.Remove()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nRemoved %s\n", removed)
+	fmt.Printf("This device is no longer in a clipboard group. `henri init` or `henri join` to set it up again.\n")
+	return nil
+}
+
+// confirm asks a yes/no question. Anything other than an explicit yes is a no,
+// and a closed stdin counts as no rather than silently proceeding.
+func confirm(question string) (bool, error) {
+	fmt.Printf("%s [y/N] ", question)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		if line == "" {
+			fmt.Println()
+			return false, nil
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	}
+	return false, nil
 }
 
 // --- helpers ---------------------------------------------------------------

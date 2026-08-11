@@ -14,6 +14,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/justin06lee/henri/internal/mnemonic"
+	"github.com/justin06lee/henri/internal/secure"
 )
 
 // Defaults used by `henri init` and filled in for older config files.
@@ -22,6 +25,11 @@ const (
 	DefaultDiscoveryPort = 47601
 	DefaultPollMillis    = 400
 	DefaultMaxBytes      = 4 << 20 // 4 MiB
+
+	// DefaultEntropyBits is the strength of a new group's recovery phrase.
+	// 128 bits is twelve words: beyond any hope of guessing, and the shortest
+	// thing anyone has to type on a second machine.
+	DefaultEntropyBits = 128
 )
 
 // Config is the whole of henri's persistent state.
@@ -32,6 +40,10 @@ type Config struct {
 	// Key is the group's 32-byte master secret, base64 (std, padded).
 	// Everything on the wire is derived from it.
 	Key string `json:"key"`
+	// Phrase is the recovery phrase this group was built from. GroupID and Key
+	// are both derived from it, so it is the only thing worth writing down.
+	// Configs created before phrases existed leave this empty and keep working.
+	Phrase string `json:"phrase,omitempty"`
 
 	DeviceID   string `json:"device_id"`
 	DeviceName string `json:"device_name"`
@@ -71,9 +83,38 @@ func Path() (string, error) {
 	return filepath.Join(home, ".config", "henri", "config.json"), nil
 }
 
-// New builds a fresh config for a brand new group.
-func New(deviceName string) (*Config, error) {
-	group, err := randomID(8)
+// New starts a brand new group: a fresh recovery phrase, with the group's
+// identity derived from it.
+func New(deviceName string, bits int) (*Config, error) {
+	if bits == 0 {
+		bits = DefaultEntropyBits
+	}
+	phrase, entropy, err := mnemonic.New(bits)
+	if err != nil {
+		return nil, err
+	}
+	return fromEntropy(phrase, entropy, deviceName)
+}
+
+// Join builds this device's config for an existing group from its phrase.
+func Join(phrase, deviceName string) (*Config, error) {
+	entropy, err := mnemonic.Decode(phrase)
+	if err != nil {
+		return nil, err
+	}
+	// Store the phrase the way it is meant to be written, not however it was
+	// typed, so `henri code` always shows the canonical form.
+	canonical, err := mnemonic.Encode(entropy)
+	if err != nil {
+		return nil, err
+	}
+	return fromEntropy(canonical, entropy, deviceName)
+}
+
+// fromEntropy assembles a config around a phrase and the identity it implies.
+// The device ID is always fresh: the group is shared, the device is not.
+func fromEntropy(phrase string, entropy []byte, deviceName string) (*Config, error) {
+	groupID, master, err := secure.DeriveGroup(entropy)
 	if err != nil {
 		return nil, err
 	}
@@ -81,13 +122,10 @@ func New(deviceName string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, err
-	}
 	return &Config{
-		GroupID:       group,
-		Key:           base64.StdEncoding.EncodeToString(key),
+		GroupID:       groupID,
+		Key:           base64.StdEncoding.EncodeToString(master),
+		Phrase:        phrase,
 		DeviceID:      device,
 		DeviceName:    deviceName,
 		ListenPort:    DefaultListenPort,
@@ -201,6 +239,19 @@ func (c *Config) Save() error {
 	return nil
 }
 
+// Remove deletes the config file, taking this device out of its group.
+// It returns the path that was removed.
+func Remove() (string, error) {
+	path, err := Path()
+	if err != nil {
+		return "", err
+	}
+	if err := os.Remove(path); err != nil {
+		return path, err
+	}
+	return path, nil
+}
+
 func randomID(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -208,3 +259,6 @@ func randomID(n int) (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
+
+// NewDeviceID returns a fresh identifier for this device.
+func NewDeviceID() (string, error) { return randomID(8) }

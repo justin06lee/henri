@@ -27,8 +27,9 @@ clipboard.
 So: <kbd>⌘C</kbd> on the laptop, <kbd>Ctrl+V</kbd> on the desktop. That's the
 whole idea.
 
-- **One shared secret.** `henri init` on one device, `henri join <code>` on the
-  rest. That code *is* the group key — there is no server and no account.
+- **Twelve words to set up.** `henri init` prints a recovery phrase; type it on
+  your other devices. Those words *are* the group key — there is no server and
+  no account.
 - **Encrypted end to end.** Every byte on the wire is sealed with AES-256-GCM
   under a key only your devices hold.
 - **Finds your devices by itself.** Machines on the same network discover each
@@ -60,8 +61,14 @@ sudo make install   # /usr/local/bin/henri
 `xclip`/`xsel` on X11:
 
 ```sh
-sudo apt install wl-clipboard      # or: xclip
+sudo pacman -S wl-clipboard xclip     # arch
+sudo apt install wl-clipboard xclip   # debian, ubuntu
+sudo dnf install wl-clipboard xclip   # fedora
 ```
+
+Install both and henri picks the right one for your session: it prefers
+`wl-clipboard` when `WAYLAND_DISPLAY` is set, because on Wayland `xclip` often
+talks to an XWayland clipboard your compositor does not share.
 
 macOS and Windows work out of the box (`pbcopy`/`pbpaste`, PowerShell).
 
@@ -75,23 +82,44 @@ On your first device:
 $ henri init
 Started a new clipboard group.
 
-  config   /Users/you/.config/henri/config.json
+  config   /home/you/.config/henri/config.json
   device   laptop
-  group    BY_l6z_OVEA
+  group    8GXyBCSt5qY
 
-Run this on every other device to join:
+Your recovery phrase — these 12 words are the whole secret:
 
-  henri join henri1:eyJnIjoiQllfbDZ6X09WRUEiLCJrIjoiWlIreWtDYzd4...
+    1. sure         2. churn        3. worry        4. hip
+    5. either       6. pole         7. drama        8. produce
+    9. bronze      10. pride       11. rigid       12. evolve
+
+On every other device, run:
+
+  henri join sure churn worry hip either pole drama produce bronze pride rigid evolve
 ```
 
-On every other device, paste that command:
+Type those words on every other device:
 
 ```console
-$ henri join henri1:eyJnIjoiQllfbDZ6X09WRUEiLCJrIjoiWlIreWtDYzd4...
-Joined group BY_l6z_OVEA as "desktop".
+$ henri join sure churn worry hip either pole drama produce bronze pride rigid evolve
+Joined group 8GXyBCSt5qY as "desktop".
 ```
 
-Then start the daemon on each:
+You do not have to be precise about it. Case, punctuation and stray whitespace
+are all ignored, and because no two words in the list share their first four
+letters you can abbreviate every one of them:
+
+```sh
+henri join sure chur worr hip eith pole dram prod bron prid rigi evol
+```
+
+Get a word wrong and henri says so instead of quietly building the wrong key:
+
+```console
+$ henri join sure churn worrry hip either pole drama produce bronze pride rigid evolve
+henri: mnemonic: word 3: "worrry" is not one of the words — did you mean "worry"?
+```
+
+Then start the daemon on each device:
 
 ```sh
 henri daemon
@@ -101,6 +129,8 @@ That's it. Copy something on one device and it is on the others' clipboards
 before you can switch windows. To leave it running for good, see
 [Running it for real](#running-it-for-real).
 
+Lost the phrase? `henri code` prints it again on any device still in the group.
+
 ---
 
 ## Commands
@@ -108,14 +138,15 @@ before you can switch windows. To leave it running for good, see
 | Command | What it does |
 | --- | --- |
 | `henri init` | Start a new clipboard group on this device |
-| `henri join <code>` | Join an existing group |
-| `henri code` | Print this group's join code again |
+| `henri join <words>` | Join an existing group using its recovery phrase |
+| `henri code` | Print this group's recovery phrase again |
 | `henri daemon` | Run the sync daemon in the foreground |
 | `henri status` | Show what the local daemon is doing |
 | `henri peers` | List known devices |
 | `henri peers add <host:port>` | Add a device that discovery can't reach |
 | `henri peers rm <host:port>` | Remove one |
 | `henri send` | Re-send the current clipboard to the group |
+| `henri leave` | Remove this device's config and leave the group |
 | `henri version` | Print the version |
 
 `henri status` is the one to reach for when something looks wrong:
@@ -174,6 +205,14 @@ it currently considers in sync. A device claims that fingerprint *before* it
 writes an incoming payload, so its own watcher sees the new content as
 already-known and never bounces it back.
 
+**The phrase is the secret.** `henri init` draws 128 bits from the system CSPRNG
+and renders them as twelve words using [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039/mnemonic.md),
+the same scheme cryptocurrency wallets use for seed phrases. The group's master
+key and its ID are both derived from that entropy with HKDF-SHA256, so the words
+are the only thing worth writing down. Four of the 132 bits are a checksum,
+which is what lets henri tell you that word 3 is wrong instead of building a key
+that silently never matches.
+
 **Two keys, one secret.** The 32-byte group key in your config is never used
 directly. HKDF-SHA256 derives one key for clipboard payloads and another for
 discovery beacons, so a beacon can't be replayed as a payload. The group ID is
@@ -197,8 +236,9 @@ and a mismatch is refused.
 
 ```json
 {
-  "group_id": "BY_l6z_OVEA",
+  "group_id": "8GXyBCSt5qY",
   "key": "ZR+ykCc7xXwnDQkC55jkGw/n4gy66Bd1WPGcavgBvb8=",
+  "phrase": "sure churn worry hip either pole drama produce bronze pride rigid evolve",
   "device_id": "-wYRDywIF9A",
   "device_name": "laptop",
   "listen_port": 47600,
@@ -212,8 +252,9 @@ and a mismatch is refused.
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `group_id` | generated | Identifies the group; shared by every device in it |
-| `key` | generated | The 32-byte group secret, base64. **This is the credential.** |
+| `phrase` | generated | The recovery phrase. `group_id` and `key` are derived from it. **This is the credential.** |
+| `group_id` | derived | Identifies the group; shared by every device in it |
+| `key` | derived | The 32-byte group secret, base64 |
 | `device_id` | generated | Unique per device; not shared |
 | `device_name` | hostname | What shows up in `henri peers` |
 | `listen_port` | `47600` | TCP port that receives clipboard updates |
@@ -280,6 +321,25 @@ belongs to that session, so a system-wide daemon could not reach it.
 
 ---
 
+## Leaving a group
+
+To take one device out:
+
+```sh
+henri leave
+```
+
+That removes the local config and nothing else — your other devices carry on
+without it, and you can rejoin later with the same phrase. henri refuses to do
+it while the daemon is running, because a running daemon already holds the key
+in memory and would keep syncing after the file was gone.
+
+There is no way to evict a device remotely. If one is lost or you want it out
+for good, run `henri init` somewhere to make a new group and re-join the devices
+you still trust; the old phrase then opens nothing that matters.
+
+---
+
 ## Security
 
 What henri gives you:
@@ -292,8 +352,9 @@ What henri gives you:
 
 What it does not give you, and you should know:
 
-- **The join code is the key.** Anyone who gets it can read everything you copy,
-  forever. Send it over something you trust, and treat it like a password.
+- **The phrase is the key.** Anyone who has those twelve words can read
+  everything you copy, forever. Read them aloud or type them in by hand; don't
+  paste them through a chat app.
 - **There is no rotation yet.** To change the key you re-run `henri init` and
   re-join every device.
 - **Your clipboard has your passwords in it.** That's true of any clipboard
@@ -301,6 +362,19 @@ What it does not give you, and you should know:
   device in the group.
 - Discovery beacons are encrypted, but their *timing and size* are visible to
   anyone on your LAN — they can tell henri is running, not what you copied.
+
+### Is twelve words enough?
+
+Yes, comfortably. Twelve words drawn from a 2048-word list is 2^128 possible
+phrases — the same strength that secures cryptocurrency wallets holding real
+money, and the same order as an AES-128 key. Guessing one is not a thing anyone
+can do with any amount of hardware.
+
+The entropy is not where the risk lives. It's in how the words travel: a phrase
+read aloud in a room stays in that room, and a phrase pasted into a chat app is
+on someone else's servers forever.
+
+If you want more anyway, `henri init -words 24` gives you 256 bits.
 
 Found a problem? Open an issue.
 
@@ -332,11 +406,13 @@ make dist    # cross-compile to dist/bin/
 
 The tests run whole groups of nodes against a fake clipboard, so they never
 touch the real one. They cover propagation between peers, the echo guard,
-foreign-key rejection, replays, oversized payloads, and peer expiry.
+foreign-key rejection, replays, oversized payloads, and peer expiry. The
+mnemonic package is checked against the official BIP-39 test vectors.
 
 ```
 cmd/henri            the CLI
 internal/config      config file: load, save, validate
+internal/mnemonic    BIP-39 recovery phrases
 internal/secure      HKDF key derivation and AES-256-GCM
 internal/clipboard   per-platform clipboard access
 internal/node        the daemon: watcher, peers, discovery, protocol
