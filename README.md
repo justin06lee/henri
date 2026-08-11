@@ -236,6 +236,17 @@ peers
 
 A few details that matter:
 
+**Changes are noticed, not hunted for.** Where the system will say when the
+clipboard changed, henri listens instead of asking: `wl-paste --watch` on
+Wayland, `clipnotify` on X11 if it is installed. Both mean henri touches the
+clipboard only when something actually happened. `henri status` shows which one
+is in use.
+
+Where neither is available it falls back to checking every 400ms, which works
+everywhere but has a cost: each check spawns a helper process, and on Wayland
+reading a selection can require briefly taking keyboard focus. Two and a half
+times a second, that is a visible flicker.
+
 **No echo storms.** Each device remembers the SHA-256 of the clipboard content
 it currently considers in sync. A device claims that fingerprint *before* it
 writes an incoming payload, so its own watcher sees the new content as
@@ -297,7 +308,8 @@ and a mismatch is refused.
 | `discovery_port` | `47601` | UDP port for multicast beacons |
 | `discovery` | `true` | Set `false` to rely only on `peers` |
 | `peers` | `[]` | Devices to always push to — for anything off the LAN |
-| `poll_interval_ms` | `400` | How often the clipboard is checked |
+| `poll_interval_ms` | `400` | How often the clipboard is checked, when no event source is available |
+| `clipboard_poll_only` | `false` | Ignore event sources and always poll |
 | `max_payload_bytes` | `4194304` | Clipboards larger than this are skipped |
 
 Devices that aren't on the same network — a VPS, or a laptop behind a different
@@ -401,6 +413,48 @@ different config.
 
 `-force` overrides either check if you know what you are doing.
 
+### If the screen flickers
+
+Symptom: windows flicker or focus jumps every half second while henri runs.
+
+That is the polling fallback. Wayland ties clipboard access to keyboard focus,
+so unless the compositor implements a data-control protocol, every read briefly
+takes focus — and polling does that 2.5 times a second. Check what henri is
+doing:
+
+```console
+$ henri status
+  clipboard  wl-clipboard
+  watching   wl-paste --watch       ← event-driven, no polling
+```
+
+If that second line reads `polling every 400ms`, henri could not find an event
+source:
+
+- **Wayland.** `wl-paste --watch` needs `wlr-data-control` (wlroots: Sway,
+  Hyprland, river) or `ext-data-control` (recent GNOME, KDE). If your compositor
+  has neither, there is no way to read the clipboard in the background without
+  taking focus, and the only lever is to poll less often.
+- **X11.** Install [`clipnotify`](https://github.com/cdown/clipnotify) — it
+  blocks until the selection changes, so henri stops asking entirely.
+
+  ```sh
+  yay -S clipnotify              # arch (AUR)
+  ```
+- **Either.** Slow the fallback down, in the config:
+
+  ```json
+  "poll_interval_ms": 2000
+  ```
+
+  Or turn event watching off entirely if it misbehaves:
+
+  ```json
+  "clipboard_poll_only": true
+  ```
+
+Restart the daemon after editing (`henri service restart`).
+
 ### If the clipboard is not readable
 
 On Linux a service can start before the graphical session has published
@@ -484,9 +538,8 @@ Found a problem? Open an issue.
 ## Limitations
 
 - **Text only.** Images and files aren't synced yet.
-- **Polling, not events.** The clipboard is checked every 400ms rather than
-  subscribed to, which is portable but means copies register within about half a
-  second rather than instantly.
+- **Polling is still the fallback.** With no event source henri checks every
+  400ms, which works everywhere but spawns a helper process each time.
 - **Two daemons on one machine won't discover each other.** They share a
   clipboard and a multicast port, so only the first to start receives beacons.
   Not a problem in the real configuration — one daemon per device — but worth

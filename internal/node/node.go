@@ -44,6 +44,7 @@ type Node struct {
 	lastFrom  string
 	lastSync  time.Time
 	clipErr   string // why the last clipboard read failed, if it did
+	watchMode string // how changes are noticed: an event source, or polling
 
 	sent     atomic.Int64
 	received atomic.Int64
@@ -147,70 +148,116 @@ func (n *Node) Run(ctx context.Context) error {
 	return runErr
 }
 
-// watch polls the clipboard and pushes anything new to the group.
+// watch notices local copies and pushes them to the group.
+//
+// Given an event source it waits on that and touches the clipboard only when
+// something actually changed; otherwise it falls back to checking on a timer.
 func (n *Node) watch(ctx context.Context) {
-	tick := time.NewTicker(time.Duration(n.cfg.PollMillis) * time.Millisecond)
+	polling := time.Duration(n.cfg.PollMillis) * time.Millisecond
+	interval := polling
+
+	var events <-chan struct{}
+	if !n.cfg.PollOnly {
+		var kind string
+		events, kind = clipboard.Events(ctx)
+		if events != nil {
+			n.setWatchMode(kind)
+			n.log.Info("watching for clipboard changes", "via", kind)
+			// With a real event source there is no reason to poll hard. Keep a
+			// slow tick purely so a dropped event cannot leave this device out
+			// of sync indefinitely.
+			interval = 30 * time.Second
+		} else {
+			n.setWatchMode("polling every " + polling.String())
+			n.log.Debug("no clipboard event source; polling", "every", polling)
+		}
+	} else {
+		n.setWatchMode("polling every " + polling.String() + " (events disabled)")
+	}
+
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case _, ok := <-events:
+			if !ok {
+				// The event source stopped. Go back to polling rather than
+				// sitting silently and syncing nothing.
+				events = nil
+				tick.Reset(polling)
+				n.setWatchMode("polling every " + polling.String() + " (event source stopped)")
+				n.log.Warn("clipboard event source stopped; polling instead", "every", polling)
+				continue
+			}
 		case <-tick.C:
 		}
+		n.checkClipboard(ctx)
+	}
+}
 
-		data, err := n.clip.Read()
-		if err != nil {
-			n.log.Debug("clipboard read failed", "err", err)
-			n.mu.Lock()
-			first := n.clipErr == ""
-			n.clipErr = err.Error()
-			n.mu.Unlock()
-			// Worth saying out loud once: a service started outside the
-			// graphical session finds the helper but cannot reach the display,
-			// and would otherwise just sit there syncing nothing.
-			if first {
-				n.log.Warn("cannot read the clipboard", "err", err)
-			}
-			continue
-		}
+func (n *Node) setWatchMode(mode string) {
+	n.mu.Lock()
+	n.watchMode = mode
+	n.mu.Unlock()
+}
+
+// checkClipboard reads the clipboard once and pushes it if it is new.
+func (n *Node) checkClipboard(ctx context.Context) {
+	data, err := n.clip.Read()
+	if err != nil {
+		n.log.Debug("clipboard read failed", "err", err)
 		n.mu.Lock()
-		recovered := n.clipErr != ""
-		n.clipErr = ""
+		first := n.clipErr == ""
+		n.clipErr = err.Error()
 		n.mu.Unlock()
-		if recovered {
-			n.log.Info("clipboard is readable again")
+		// Worth saying out loud once: a service started outside the graphical
+		// session finds the helper but cannot reach the display, and would
+		// otherwise just sit there syncing nothing.
+		if first {
+			n.log.Warn("cannot read the clipboard", "err", err)
 		}
-		if len(data) == 0 {
-			continue
-		}
-		if len(data) > n.cfg.MaxBytes {
-			// Record the hash anyway so we do not warn about it every tick.
-			h := secure.Hash(data)
-			n.mu.Lock()
-			skip := n.lastHash == h
-			n.lastHash = h
-			n.mu.Unlock()
-			if !skip {
-				n.log.Warn("clipboard too large to sync",
-					"bytes", len(data), "limit", n.cfg.MaxBytes)
-			}
-			continue
-		}
+		return
+	}
+	n.mu.Lock()
+	recovered := n.clipErr != ""
+	n.clipErr = ""
+	n.mu.Unlock()
+	if recovered {
+		n.log.Info("clipboard is readable again")
+	}
 
+	if len(data) == 0 {
+		return
+	}
+	if len(data) > n.cfg.MaxBytes {
+		// Record the hash anyway so we do not warn about it every time.
 		h := secure.Hash(data)
 		n.mu.Lock()
-		if h == n.lastHash {
-			n.mu.Unlock()
-			continue
-		}
+		skip := n.lastHash == h
 		n.lastHash = h
-		n.lastBytes = len(data)
-		n.lastFrom = "local"
-		n.lastSync = time.Now()
 		n.mu.Unlock()
-
-		n.push(ctx, data, h)
+		if !skip {
+			n.log.Warn("clipboard too large to sync", "bytes", len(data), "limit", n.cfg.MaxBytes)
+		}
+		return
 	}
+
+	h := secure.Hash(data)
+	n.mu.Lock()
+	if h == n.lastHash {
+		n.mu.Unlock()
+		return
+	}
+	n.lastHash = h
+	n.lastBytes = len(data)
+	n.lastFrom = "local"
+	n.lastSync = time.Now()
+	n.mu.Unlock()
+
+	n.push(ctx, data, h)
 }
 
 // push sends one clipboard payload to every known peer, concurrently.
@@ -405,7 +452,7 @@ func (n *Node) pushCurrent() error {
 func (n *Node) state() *State {
 	n.mu.Lock()
 	lastHash, lastBytes, lastFrom, lastSync := n.lastHash, n.lastBytes, n.lastFrom, n.lastSync
-	clipErr := n.clipErr
+	clipErr, watchMode := n.clipErr, n.watchMode
 	n.mu.Unlock()
 
 	st := &State{
@@ -418,6 +465,7 @@ func (n *Node) state() *State {
 		Discovery:    n.cfg.Discovery,
 		Tool:         n.clip.Name(),
 		ClipboardErr: clipErr,
+		WatchMode:    watchMode,
 		LastHash:     lastHash,
 		LastBytes:    lastBytes,
 		LastFrom:     lastFrom,

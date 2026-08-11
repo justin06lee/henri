@@ -27,7 +27,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.4.0"
+var version = "0.5.0"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
@@ -374,6 +374,9 @@ func cmdStatus() error {
 		fmt.Printf("  clipboard  %s  ⚠ not readable: %s\n", st.Tool, st.ClipboardErr)
 	} else {
 		fmt.Printf("  clipboard  %s\n", st.Tool)
+	}
+	if st.WatchMode != "" {
+		fmt.Printf("  watching   %s\n", st.WatchMode)
 	}
 	fmt.Printf("  listening  :%d   discovery %s\n", st.ListenPort, onOff(st.Discovery))
 	fmt.Printf("  uptime     %s   pid %d\n", since(st.StartedAt), st.PID)
