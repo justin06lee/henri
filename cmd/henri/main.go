@@ -28,7 +28,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.8.0"
+var version = "0.9.0"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
@@ -59,7 +59,7 @@ func run(args []string) error {
 	case "peers":
 		return cmdPeers(args[1:])
 	case "send", "push":
-		return cmdSend()
+		return cmdSend(args[1:])
 	case "leave", "forget":
 		return cmdLeave(args[1:])
 	case "service":
@@ -91,7 +91,7 @@ usage: henri <command> [flags]
   hotkey          bind a key to ` + "`henri send`" + `, for desktops henri cannot watch
   status          show what the local daemon is doing
   peers           list known devices; ` + "`peers add|rm <host:port>`" + ` to edit
-  send            re-send the current clipboard to the group
+  send            send the clipboard to the group (-highlighted for the selection)
   leave           remove this device's config and leave the group
   version         print the version
 
@@ -387,6 +387,7 @@ func cmdStatus() error {
 			fmt.Printf("\nThis compositor only gives the clipboard to the focused window, so henri\n")
 			fmt.Printf("cannot notice copies on its own. Bind a key to push them:\n\n")
 			fmt.Printf("    henri hotkey install\n")
+			fmt.Printf("\nThat key copies whatever you have highlighted and sends it in one press.\n")
 		}()
 	}
 	fmt.Printf("  listening  :%d   discovery %s\n", st.ListenPort, onOff(st.Discovery))
@@ -511,15 +512,25 @@ func printPeers(peers []node.PeerInfo) {
 
 // --- send ------------------------------------------------------------------
 
-func cmdSend() error {
+func cmdSend(args []string) error {
+	fs := flag.NewFlagSet("send", flag.ContinueOnError)
+	highlighted := fs.Bool("highlighted", false,
+		"send the highlighted text (the PRIMARY selection) and copy it here too, rather than the clipboard")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	if _, err := node.Query(cfg, node.KindPush); err != nil {
+	if _, err := node.QueryPush(cfg, *highlighted); err != nil {
 		return err
 	}
-	fmt.Println("Sent the current clipboard to the group.")
+	if *highlighted {
+		fmt.Println("Copied the highlighted text and sent it to the group.")
+	} else {
+		fmt.Println("Sent the current clipboard to the group.")
+	}
 	return nil
 }
 
@@ -815,7 +826,7 @@ func cmdHotkeyInstall(accel string) error {
 	if err != nil {
 		return err
 	}
-	command := binary + " send"
+	command := binary + " send -highlighted"
 
 	if err := hotkey.Install(command, accel); err != nil {
 		if errors.Is(err, hotkey.ErrManual) {
@@ -826,10 +837,16 @@ func cmdHotkeyInstall(accel string) error {
 		return err
 	}
 
-	fmt.Printf("Bound %s to `henri send`.\n\n", hotkey.Human(accel))
+	fmt.Printf("Bound %s.\n\n", hotkey.Human(accel))
 	fmt.Printf("  command  %s\n\n", command)
-	fmt.Printf("Copy as usual, then press %s to push it to your other devices.\n", hotkey.Human(accel))
-	fmt.Printf("Receiving stays automatic — this is only needed for sending.\n")
+	fmt.Printf("Highlight some text and press %s. It copies the highlighted\n", hotkey.Human(accel))
+	fmt.Printf("text to this device's clipboard and sends it to the others in one go —\n")
+	fmt.Printf("no Ctrl+C needed, because highlighted text is already published.\n\n")
+	fmt.Printf("Receiving stays automatic; this is only about sending.\n")
+	if !clipboard.HasPrimary() {
+		fmt.Printf("\nNote: this system has no separate selection for highlighted text,\n")
+		fmt.Printf("so the key will send the clipboard instead.\n")
+	}
 	return nil
 }
 
@@ -887,7 +904,7 @@ func since(unixMilli int64) string {
 	d := time.Since(time.UnixMilli(unixMilli))
 	switch {
 	case d < time.Second:
-		return "just now"
+		return "0s"
 	case d < time.Minute:
 		return fmt.Sprintf("%ds", int(d.Seconds()))
 	case d < time.Hour:

@@ -20,8 +20,9 @@ import (
 // fakeClipboard stands in for the system clipboard so tests never touch the
 // developer's real one.
 type fakeClipboard struct {
-	mu   sync.Mutex
-	data []byte
+	mu      sync.Mutex
+	data    []byte
+	primary []byte
 }
 
 func (f *fakeClipboard) Read() ([]byte, error) {
@@ -37,7 +38,19 @@ func (f *fakeClipboard) Write(d []byte) error {
 	return nil
 }
 
+func (f *fakeClipboard) ReadPrimary() ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]byte(nil), f.primary...), nil
+}
+
 func (f *fakeClipboard) Name() string { return "fake" }
+
+func (f *fakeClipboard) highlight(s string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.primary = []byte(s)
+}
 
 func (f *fakeClipboard) set(s string) {
 	f.mu.Lock()
@@ -373,4 +386,74 @@ func mustKey(t *testing.T, b64 string) []byte {
 		t.Fatal(err)
 	}
 	return k
+}
+
+// One keypress has to do both halves: put the highlighted text on this
+// device's clipboard, and send it to the others.
+func TestPushHighlightedCopiesLocallyAndSends(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+	_, clipA := startNode(t, ctx, "alpha", group, key, portA, []string{fmt.Sprintf("127.0.0.1:%d", portB)})
+	_, clipB := startNode(t, ctx, "beta", group, key, portB, nil)
+
+	clipA.set("old clipboard")
+	clipA.highlight("highlighted words")
+	waitFor(t, "alpha's own copy to settle", func() bool { return clipB.get() == "old clipboard" })
+
+	cfg := &config.Config{GroupID: group, Key: key, DeviceID: "cli", DeviceName: "cli", ListenPort: portA}
+	if _, err := QueryPush(cfg, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := clipA.get(); got != "highlighted words" {
+		t.Fatalf("alpha's clipboard is %q, want the highlighted text", got)
+	}
+	waitFor(t, "beta to receive the highlighted text", func() bool { return clipB.get() == "highlighted words" })
+}
+
+// Pressing the key with nothing highlighted should still send the clipboard
+// rather than reporting an error.
+func TestPushHighlightedFallsBackToClipboard(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+	_, clipA := startNode(t, ctx, "alpha", group, key, portA, []string{fmt.Sprintf("127.0.0.1:%d", portB)})
+	_, clipB := startNode(t, ctx, "beta", group, key, portB, nil)
+
+	clipA.set("only the clipboard")
+	clipA.highlight("")
+	waitFor(t, "the initial copy to land", func() bool { return clipB.get() == "only the clipboard" })
+
+	cfg := &config.Config{GroupID: group, Key: key, DeviceID: "cli", DeviceName: "cli", ListenPort: portA}
+	if _, err := QueryPush(cfg, true); err != nil {
+		t.Fatalf("pressing the key with nothing highlighted failed: %v", err)
+	}
+}
+
+// And it must not double-send: claiming the hash before writing locally is what
+// stops the watcher treating the local copy as a fresh one.
+func TestPushHighlightedDoesNotDoubleSend(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+	a, clipA := startNode(t, ctx, "alpha", group, key, portA, []string{fmt.Sprintf("127.0.0.1:%d", portB)})
+	startNode(t, ctx, "beta", group, key, portB, nil)
+
+	clipA.highlight("just this once")
+	cfg := &config.Config{GroupID: group, Key: key, DeviceID: "cli", DeviceName: "cli", ListenPort: portA}
+	if _, err := QueryPush(cfg, true); err != nil {
+		t.Fatal(err)
+	}
+	before := a.sent.Load()
+	time.Sleep(400 * time.Millisecond)
+	if after := a.sent.Load(); after != before {
+		t.Fatalf("the highlighted text was sent again by the watcher (%d -> %d)", before, after)
+	}
 }

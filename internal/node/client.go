@@ -18,6 +18,15 @@ var ErrNotRunning = errors.New("henri: the daemon is not running (start it with 
 // reply. It reuses the group key, so a process that cannot read the config
 // cannot drive the daemon.
 func Query(cfg *config.Config, kind string) (*Message, error) {
+	return query(cfg, kind, false)
+}
+
+// QueryPush asks the daemon to send the clipboard, or the highlighted text.
+func QueryPush(cfg *config.Config, primary bool) (*Message, error) {
+	return query(cfg, KindPush, primary)
+}
+
+func query(cfg *config.Config, kind string, primary bool) (*Message, error) {
 	master, err := cfg.MasterKey()
 	if err != nil {
 		return nil, err
@@ -39,11 +48,12 @@ func Query(cfg *config.Config, kind string) (*Message, error) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	req := &Message{
-		V:      ProtocolVersion,
-		Kind:   kind,
-		Device: cfg.DeviceID,
-		Name:   cfg.DeviceName,
-		TS:     time.Now().UnixMilli(),
+		V:       ProtocolVersion,
+		Kind:    kind,
+		Device:  cfg.DeviceID,
+		Name:    cfg.DeviceName,
+		TS:      time.Now().UnixMilli(),
+		Primary: primary,
 	}
 	if err := writeFrame(conn, box, req); err != nil {
 		return nil, err

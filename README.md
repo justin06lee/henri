@@ -181,7 +181,8 @@ Lost the phrase? `henri code` prints it again on any device still in the group.
 | `henri peers` | List known devices |
 | `henri peers add <host:port>` | Add a device that discovery can't reach |
 | `henri peers rm <host:port>` | Remove one |
-| `henri send` | Re-send the current clipboard to the group |
+| `henri send` | Send the current clipboard to the group |
+| `henri send -highlighted` | Copy the highlighted text here *and* send it |
 | `henri hotkey install` | Bind a key to `henri send`, for desktops henri cannot watch |
 | `henri hotkey status` | Show the current binding |
 | `henri hotkey uninstall` | Remove it |
@@ -437,15 +438,24 @@ cannot notice copies on its own. Bind a key to push them:
     henri hotkey install
 ```
 
-That binds **Super+Shift+C** to `henri send`. Copy as usual, press the key when
-you want that copy on your other devices:
+That binds **Super+Shift+C** to copy *and* send in one press:
 
 ```console
 $ henri hotkey install
-Bound Super+Shift+C to `henri send`.
+Bound Super+Shift+C.
 
-  command  /usr/local/bin/henri send
+  command  /usr/local/bin/henri send -highlighted
 ```
+
+Highlight some text, press the key. It lands on this device's clipboard and on
+every other device's, with no Ctrl+C in between.
+
+That works because highlighted text is already published: X11 and Wayland both
+track a **PRIMARY selection** alongside the clipboard, updated by every app as
+you drag over text — it is what middle-click pastes. So henri can read what you
+have highlighted without synthesising a keystroke or asking the compositor for
+anything it does not want to give. With nothing highlighted the key falls back
+to sending the clipboard.
 
 Receiving stays automatic — this only affects sending. Pick a different key with
 `-accel`, using GNOME's syntax:

@@ -41,6 +41,9 @@ type Message struct {
 	// Hello.
 	Port int `json:"port,omitempty"`
 
+	// Push: take the highlighted text rather than the clipboard.
+	Primary bool `json:"primary,omitempty"`
+
 	// Clip.
 	Hash string `json:"hash,omitempty"`
 	Data []byte `json:"data,omitempty"`

@@ -381,7 +381,7 @@ func (n *Node) handle(conn net.Conn) {
 		reply.State = n.state()
 	case KindPush:
 		reply.Kind = KindAck
-		if err := n.pushCurrent(); err != nil {
+		if err := n.pushCurrent(msg.Primary); err != nil {
 			reply.Err = err.Error()
 		}
 	default:
@@ -438,14 +438,33 @@ func (n *Node) applyClip(msg *Message, remote net.Addr) error {
 	return nil
 }
 
-// pushCurrent re-sends whatever is on the clipboard right now.
-func (n *Node) pushCurrent() error {
-	data, err := n.clip.Read()
-	if err != nil {
+// pushCurrent sends the clipboard, or the highlighted text, to the group.
+//
+// With primary set it takes the PRIMARY selection and puts it on the local
+// clipboard on the way past, so one keypress both copies and sends. That is the
+// whole trick for compositors henri cannot watch: highlighted text is already
+// published, so nothing has to synthesise a Ctrl+C to get at it.
+func (n *Node) pushCurrent(primary bool) error {
+	var data []byte
+	var err error
+	if primary {
+		data, err = n.clip.ReadPrimary()
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			// Nothing highlighted; fall back to the clipboard so the key still
+			// does something sensible.
+			if data, err = n.clip.Read(); err != nil {
+				return err
+			}
+			primary = false
+		}
+	} else if data, err = n.clip.Read(); err != nil {
 		return err
 	}
 	if len(data) == 0 {
-		return errors.New("clipboard is empty")
+		return errors.New("nothing is highlighted and the clipboard is empty")
 	}
 	if len(data) > n.cfg.MaxBytes {
 		return fmt.Errorf("clipboard is %d bytes, over the %d byte limit", len(data), n.cfg.MaxBytes)
@@ -457,6 +476,15 @@ func (n *Node) pushCurrent() error {
 	n.lastFrom = "local"
 	n.lastSync = time.Now()
 	n.mu.Unlock()
+
+	// Claiming the hash above means the watcher will not treat this as a new
+	// copy and send it twice.
+	if primary {
+		if err := n.clip.Write(data); err != nil {
+			return fmt.Errorf("copied to the group but not to this device's clipboard: %w", err)
+		}
+	}
+
 	n.push(context.Background(), data, h)
 	return nil
 }

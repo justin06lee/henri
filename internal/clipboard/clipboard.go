@@ -42,6 +42,12 @@ type tool struct {
 	// writeBin/writeArgs consume new contents on stdin.
 	writeBin  string
 	writeArgs []string
+	// primaryBin/primaryArgs read the PRIMARY selection -- the text you have
+	// highlighted, which X11 and Wayland both track separately from the
+	// clipboard and update without anyone pressing a key. Empty where the
+	// platform has no such concept.
+	primaryBin  string
+	primaryArgs []string
 	// needBins must all exist on PATH for this tool to be usable.
 	needBins []string
 
@@ -90,31 +96,37 @@ func candidates() []tool {
 			// -t text asks for a plain-text flavour specifically: without it a
 			// copy from a browser can come back as text/html, or as an image,
 			// which is not what the other devices want to paste.
-			readBin:   "wl-paste",
-			readArgs:  []string{"--no-newline", "--type", "text"},
-			writeBin:  "wl-copy",
-			writeArgs: []string{"--type", "text/plain;charset=utf-8", "--"},
-			needBins:  []string{"wl-paste", "wl-copy"},
-			forks:     true,
+			readBin:     "wl-paste",
+			readArgs:    []string{"--no-newline", "--type", "text"},
+			primaryBin:  "wl-paste",
+			primaryArgs: []string{"--primary", "--no-newline", "--type", "text"},
+			writeBin:    "wl-copy",
+			writeArgs:   []string{"--type", "text/plain;charset=utf-8", "--"},
+			needBins:    []string{"wl-paste", "wl-copy"},
+			forks:       true,
 		}
 		x11 := []tool{
 			{
-				name:      "xclip",
-				readBin:   "xclip",
-				readArgs:  []string{"-selection", "clipboard", "-o"},
-				writeBin:  "xclip",
-				writeArgs: []string{"-selection", "clipboard", "-i"},
-				needBins:  []string{"xclip"},
-				forks:     true,
+				name:        "xclip",
+				readBin:     "xclip",
+				readArgs:    []string{"-selection", "clipboard", "-o"},
+				primaryBin:  "xclip",
+				primaryArgs: []string{"-selection", "primary", "-o"},
+				writeBin:    "xclip",
+				writeArgs:   []string{"-selection", "clipboard", "-i"},
+				needBins:    []string{"xclip"},
+				forks:       true,
 			},
 			{
-				name:      "xsel",
-				readBin:   "xsel",
-				readArgs:  []string{"--clipboard", "--output"},
-				writeBin:  "xsel",
-				writeArgs: []string{"--clipboard", "--input"},
-				needBins:  []string{"xsel"},
-				forks:     true,
+				name:        "xsel",
+				readBin:     "xsel",
+				readArgs:    []string{"--clipboard", "--output"},
+				primaryBin:  "xsel",
+				primaryArgs: []string{"--primary", "--output"},
+				writeBin:    "xsel",
+				writeArgs:   []string{"--clipboard", "--input"},
+				needBins:    []string{"xsel"},
+				forks:       true,
 			},
 		}
 
@@ -202,6 +214,46 @@ func Read() ([]byte, error) {
 		out = bytes.ReplaceAll(out, []byte("\r\n"), []byte("\n"))
 	}
 	return out, nil
+}
+
+// ErrNoPrimary means this platform has no PRIMARY selection. macOS and Windows
+// have only one clipboard; highlighting text there does not publish it
+// anywhere.
+var ErrNoPrimary = errors.New("clipboard: this system has no separate selection for highlighted text")
+
+// ReadPrimary returns the PRIMARY selection: whatever is highlighted right now.
+//
+// X11 and Wayland both maintain this alongside the clipboard, and every app
+// updates it as you drag over text -- no copy command involved. It is what
+// middle-click pastes.
+func ReadPrimary() ([]byte, error) {
+	t, err := resolve()
+	if err != nil {
+		return nil, err
+	}
+	if t.primaryBin == "" {
+		return nil, ErrNoPrimary
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, t.primaryBin, t.primaryArgs...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if stdout.Len() == 0 && looksEmpty(stderr.String()) {
+			return nil, nil // nothing highlighted
+		}
+		return nil, fmt.Errorf("clipboard: %s: %w: %s", t.name, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
+// HasPrimary reports whether this system tracks highlighted text separately.
+func HasPrimary() bool {
+	t, err := resolve()
+	return err == nil && t.primaryBin != ""
 }
 
 // Write replaces the clipboard contents.
