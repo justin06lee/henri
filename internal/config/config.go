@@ -146,7 +146,7 @@ func Load() (*Config, error) {
 	}
 	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("no config at %s: run `henri init` or `henri join <code>` first", path)
+		return nil, fmt.Errorf("no config at %s: run `henri init` or `henri join <words>` first", path)
 	}
 	if err != nil {
 		return nil, err
@@ -264,3 +264,22 @@ func randomID(n int) (string, error) {
 
 // NewDeviceID returns a fresh identifier for this device.
 func NewDeviceID() (string, error) { return randomID(8) }
+
+// ResolvedPath returns the config location with symlinks followed. It is the
+// path the kernel actually opens, which is what matters when deciding whether
+// the file lives somewhere a background service can reach: `~/.config` is very
+// often a link into a dotfiles directory somewhere else entirely.
+func ResolvedPath() (string, error) {
+	path, err := Path()
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved, nil
+	}
+	// The file may not exist yet; resolve as much of the directory as we can.
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		return filepath.Join(dir, filepath.Base(path)), nil
+	}
+	return path, nil
+}

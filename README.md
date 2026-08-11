@@ -37,6 +37,8 @@ whole idea.
 - **Mixed groups work.** macOS, Linux and Windows devices all sit in the same
   group — the protocol is identical everywhere and text is normalised to UTF-8
   with `\n` line endings, so a copy on a Mac pastes unchanged on Linux.
+- **Starts at login.** `henri service install` sets it up as a launchd agent or
+  a systemd user unit and gets out of the way.
 - **One static binary, no dependencies.** Nothing outside the Go standard
   library, no cgo.
 
@@ -149,8 +151,14 @@ henri daemon
 ```
 
 That's it. Copy something on one device and it is on the others' clipboards
-before you can switch windows. To leave it running for good, see
-[Running it for real](#running-it-for-real).
+before you can switch windows.
+
+To stop babysitting a terminal, install it as a background service that starts
+at login:
+
+```sh
+henri service install
+```
 
 Lost the phrase? `henri code` prints it again on any device still in the group.
 
@@ -164,6 +172,11 @@ Lost the phrase? `henri code` prints it again on any device still in the group.
 | `henri join <words>` | Join an existing group using its recovery phrase |
 | `henri code` | Print this group's recovery phrase again |
 | `henri daemon` | Run the sync daemon in the foreground |
+| `henri service install` | Run henri in the background, starting at login |
+| `henri service status` | Is it installed, enabled and running? |
+| `henri service logs` | Follow the background daemon's output |
+| `henri service restart` | Restart it after a config change |
+| `henri service uninstall` | Stop it and remove the unit |
 | `henri status` | Show what the local daemon is doing |
 | `henri peers` | List known devices |
 | `henri peers add <host:port>` | Add a device that discovery can't reach |
@@ -322,25 +335,84 @@ multicast or the firewall.
 
 ## Running it for real
 
-**macOS** (launchd):
+`henri daemon` runs in the foreground, which is useful for watching what it
+does but not for actually living with. To have it run in the background and
+come back at login:
 
 ```sh
-cp dist/com.justin06lee.henri.plist ~/Library/LaunchAgents/
-launchctl load -w ~/Library/LaunchAgents/com.justin06lee.henri.plist
+henri service install
 ```
 
-**Linux** (systemd user unit):
+That is all of it. On macOS it writes a launchd agent, on Linux a systemd user
+unit, and starts it straight away:
+
+```console
+$ henri service install
+Installing henri as a launchd service.
+
+  binary   /usr/local/bin/henri
+  unit     /Users/you/Library/LaunchAgents/com.justin06lee.henri.plist
+
+Waiting for it to start
+
+henri is running in the background and will start again at login.
+```
+
+The rest:
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp dist/henri.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now henri
-journalctl --user -u henri -f
+henri service status      # installed? running? will it come back at login?
+henri service logs        # follow its output
+henri service restart     # after changing the config
+henri service uninstall   # stop it and remove the unit
 ```
 
 Both run as *your* user inside your graphical session, on purpose: the clipboard
 belongs to that session, so a system-wide daemon could not reach it.
+
+### Two things it checks before installing
+
+A service records one exact binary path and one config location and runs them
+forever after, so henri refuses to install if either is somewhere it might not
+find later:
+
+- **A binary on removable media.** Point a login service at
+  `/Volumes/SomeDrive/henri` and it fails to start every time the drive is out.
+  Install to `/usr/local/bin` first.
+- **A config on removable media.** This one is easy to miss, because `~/.config`
+  is so often a symlink into a dotfiles directory that lives somewhere else. If
+  it resolves onto an external volume, the daemon cannot read it at login: the
+  volume may not be mounted yet, and macOS gates removable volumes behind a
+  permission prompt that a background service has no way to answer — the read
+  simply blocks forever.
+
+Move the config to the internal disk and tell henri where it went:
+
+```sh
+mkdir -p ~/.henri && mv ~/.config/henri/config.json ~/.henri/config.json
+export HENRI_CONFIG=$HOME/.henri/config.json    # add this to your shell rc
+henri service install
+```
+
+`henri service install` records `HENRI_CONFIG` and `XDG_CONFIG_HOME` in the unit
+it writes, so the background daemon reads the same file your shell does. Service
+managers start with a bare environment and would otherwise quietly read a
+different config.
+
+`-force` overrides either check if you know what you are doing.
+
+### If the clipboard is not readable
+
+On Linux a service can start before the graphical session has published
+`DISPLAY` or `WAYLAND_DISPLAY`, leaving the daemon running but unable to read
+anything. `henri service install` captures those variables from the session you
+run it in and writes them into the unit, which avoids the problem in most
+setups. If it still happens, `henri status` says so rather than leaving you to
+guess:
+
+```
+  clipboard  xclip  ⚠ not readable: Can't open display
+```
 
 ---
 
@@ -421,6 +493,9 @@ Found a problem? Open an issue.
   knowing if you're testing on a single box. Use `peers` for that.
 - **No history.** henri syncs the current clipboard; it isn't a clipboard
   manager.
+- **`henri service` is macOS and Linux only.** Windows syncs fine, but has no
+  install-at-login integration yet; run `henri daemon` from a shortcut in
+  `shell:startup` for now.
 
 ---
 
@@ -445,6 +520,7 @@ internal/mnemonic    BIP-39 recovery phrases
 internal/secure      HKDF key derivation and AES-256-GCM
 internal/clipboard   per-platform clipboard access
 internal/node        the daemon: watcher, peers, discovery, protocol
+internal/service     launchd and systemd integration
 assets/              the panel image, used for the README and the tray icon
 ```
 
