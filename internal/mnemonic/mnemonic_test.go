@@ -207,3 +207,27 @@ func TestWordListShape(t *testing.T) {
 		pre[p] = w
 	}
 }
+
+// Swapping two letters is the typo people actually make, so the suggestion has
+// to rank a transposition above an unrelated word at the same plain-Levenshtein
+// distance -- "socail" is two substitutions from both "social" and "local".
+func TestSuggestionHandlesTransposedLetters(t *testing.T) {
+	cases := map[string]string{
+		"socail":  "social",
+		"recieve": "receive",
+		"stpe":    "step",
+		"abandno": "abandon",
+		"capitla": "capital",
+		"sausge":  "sausage",
+		"brdige":  "bridge",
+		"silevr":  "silver",
+	}
+	for typed, want := range cases {
+		if _, ok := byWord[want]; !ok {
+			t.Fatalf("test is wrong: %q is not in the word list", want)
+		}
+		if got := suggest(typed); got != want {
+			t.Errorf("suggest(%q) = %q, want %q", typed, got, want)
+		}
+	}
+}

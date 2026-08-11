@@ -27,9 +27,11 @@ const (
 	DefaultMaxBytes      = 4 << 20 // 4 MiB
 
 	// DefaultEntropyBits is the strength of a new group's recovery phrase.
-	// 128 bits is twelve words: beyond any hope of guessing, and the shortest
-	// thing anyone has to type on a second machine.
-	DefaultEntropyBits = 128
+	// 160 bits is fifteen words. BIP-39 phrase lengths are always a multiple of
+	// three -- each word carries 11 bits and the checksum is a 32nd of the
+	// entropy, so the word count works out to 32*bits/3 and only 12, 15, 18, 21
+	// and 24 come out whole.
+	DefaultEntropyBits = 160
 )
 
 // Config is the whole of henri's persistent state.

@@ -27,7 +27,7 @@ clipboard.
 So: <kbd>⌘C</kbd> on the laptop, <kbd>Ctrl+V</kbd> on the desktop. That's the
 whole idea.
 
-- **Twelve words to set up.** `henri init` prints a recovery phrase; type it on
+- **Fifteen words to set up.** `henri init` prints a recovery phrase; type it on
   your other devices. Those words *are* the group key — there is no server and
   no account.
 - **Encrypted end to end.** Every byte on the wire is sealed with AES-256-GCM
@@ -84,24 +84,25 @@ Started a new clipboard group.
 
   config   /home/you/.config/henri/config.json
   device   laptop
-  group    8GXyBCSt5qY
+  group    JS8lEL6zZyc
 
-Your recovery phrase — these 12 words are the whole secret:
+Your recovery phrase — these 15 words are the whole secret:
 
-    1. sure         2. churn        3. worry        4. hip
-    5. either       6. pole         7. drama        8. produce
-    9. bronze      10. pride       11. rigid       12. evolve
+    1. glue         2. report       3. social       4. awake
+    5. strike       6. piano        7. arm          8. awesome
+    9. wage        10. eternal     11. bean        12. smile
+   13. real        14. release     15. couple
 
 On every other device, run:
 
-  henri join sure churn worry hip either pole drama produce bronze pride rigid evolve
+  henri join glue report social awake strike piano arm awesome wage eternal bean smile real release couple
 ```
 
 Type those words on every other device:
 
 ```console
-$ henri join sure churn worry hip either pole drama produce bronze pride rigid evolve
-Joined group 8GXyBCSt5qY as "desktop".
+$ henri join glue report social awake strike piano arm awesome wage eternal bean smile real release couple
+Joined group JS8lEL6zZyc as "desktop".
 ```
 
 You do not have to be precise about it. Case, punctuation and stray whitespace
@@ -109,14 +110,22 @@ are all ignored, and because no two words in the list share their first four
 letters you can abbreviate every one of them:
 
 ```sh
-henri join sure chur worr hip eith pole dram prod bron prid rigi evol
+henri join glue repo soci awak stri pian arm awes wage eter bean smil real rele coup
 ```
 
-Get a word wrong and henri says so instead of quietly building the wrong key:
+Get a word wrong and henri says so, instead of quietly building the wrong key:
 
 ```console
-$ henri join sure churn worrry hip either pole drama produce bronze pride rigid evolve
-henri: mnemonic: word 3: "worrry" is not one of the words — did you mean "worry"?
+$ henri join glue report socail awake strike ...
+henri: mnemonic: word 3: "socail" is not one of the words — did you mean "social"?
+```
+
+Get the *order* wrong and the checksum catches that too:
+
+```console
+$ henri join report glue social awake strike ...
+henri: mnemonic: that phrase does not check out — every word is real, so one of
+them is probably in the wrong place or slightly wrong
 ```
 
 Then start the daemon on each device:
@@ -205,11 +214,11 @@ it currently considers in sync. A device claims that fingerprint *before* it
 writes an incoming payload, so its own watcher sees the new content as
 already-known and never bounces it back.
 
-**The phrase is the secret.** `henri init` draws 128 bits from the system CSPRNG
-and renders them as twelve words using [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039/mnemonic.md),
+**The phrase is the secret.** `henri init` draws 160 bits from the system CSPRNG
+and renders them as fifteen words using [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039/mnemonic.md),
 the same scheme cryptocurrency wallets use for seed phrases. The group's master
 key and its ID are both derived from that entropy with HKDF-SHA256, so the words
-are the only thing worth writing down. Four of the 132 bits are a checksum,
+are the only thing worth writing down. Five of the 165 bits are a checksum,
 which is what lets henri tell you that word 3 is wrong instead of building a key
 that silently never matches.
 
@@ -236,9 +245,9 @@ and a mismatch is refused.
 
 ```json
 {
-  "group_id": "8GXyBCSt5qY",
+  "group_id": "JS8lEL6zZyc",
   "key": "ZR+ykCc7xXwnDQkC55jkGw/n4gy66Bd1WPGcavgBvb8=",
-  "phrase": "sure churn worry hip either pole drama produce bronze pride rigid evolve",
+  "phrase": "glue report social awake strike piano arm awesome wage eternal bean smile real release couple",
   "device_id": "-wYRDywIF9A",
   "device_name": "laptop",
   "listen_port": 47600,
@@ -352,7 +361,7 @@ What henri gives you:
 
 What it does not give you, and you should know:
 
-- **The phrase is the key.** Anyone who has those twelve words can read
+- **The phrase is the key.** Anyone who has those fifteen words can read
   everything you copy, forever. Read them aloud or type them in by hand; don't
   paste them through a chat app.
 - **There is no rotation yet.** To change the key you re-run `henri init` and
@@ -363,18 +372,24 @@ What it does not give you, and you should know:
 - Discovery beacons are encrypted, but their *timing and size* are visible to
   anyone on your LAN — they can tell henri is running, not what you copied.
 
-### Is twelve words enough?
+### Is fifteen words enough?
 
-Yes, comfortably. Twelve words drawn from a 2048-word list is 2^128 possible
-phrases — the same strength that secures cryptocurrency wallets holding real
-money, and the same order as an AES-128 key. Guessing one is not a thing anyone
-can do with any amount of hardware.
+Yes, with room to spare. Fifteen words drawn from a 2048-word list is 2^160
+possible phrases. For scale, twelve words — 2^128, which is what secures
+cryptocurrency wallets holding real money — is already past what anyone can
+search with any amount of hardware; fifteen is four billion times that again.
 
 The entropy is not where the risk lives. It's in how the words travel: a phrase
 read aloud in a room stays in that room, and a phrase pasted into a chat app is
 on someone else's servers forever.
 
-If you want more anyway, `henri init -words 24` gives you 256 bits.
+`henri init -words 12` is shorter to type and still ample; `-words 24` gives you
+256 bits if you would rather.
+
+Phrase lengths are always a multiple of three — 12, 15, 18, 21 or 24. Each word
+carries 11 bits and the checksum is a 32nd of the entropy, so the word count
+works out to `32 x bits / 3` and only those five come out whole. There is no
+such thing as a 16-word BIP-39 phrase.
 
 Found a problem? Open an issue.
 
