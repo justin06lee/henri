@@ -1,6 +1,7 @@
 package clipboard
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 // fakeForkingHelper writes a script that behaves the way xclip, xsel and
 // wl-copy do: consume stdin, leave a background process holding the inherited
 // file descriptors, and exit.
-func fakeForkingHelper(t *testing.T) (script, captured string) {
+func fakeForkingHelper(t *testing.T, holdSeconds int) (script, captured string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("needs a POSIX shell")
@@ -22,7 +23,7 @@ func fakeForkingHelper(t *testing.T) (script, captured string) {
 	captured = filepath.Join(dir, "captured")
 	body := "#!/bin/sh\n" +
 		"cat > \"" + captured + "\"\n" +
-		"sleep 2 &\n" + // inherits stdout/stderr, exactly like a real clipboard owner
+		fmt.Sprintf("sleep %d &\n", holdSeconds) + // inherits our streams, like a real clipboard owner
 		"exit 0\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
@@ -34,7 +35,12 @@ func fakeForkingHelper(t *testing.T) (script, captured string) {
 // backgrounded child too, so every copy on X11/Wayland would stall until the
 // timeout killed the helper. Detaching the streams fixes it.
 func TestWriteWithDetachesFromForkingHelper(t *testing.T) {
-	script, captured := fakeForkingHelper(t)
+	// The helper holds our streams for a long time, so the two outcomes are far
+	// apart: a detached write returns in milliseconds, while an attached one
+	// would wait the full hold. The threshold sits between them with room to
+	// spare, since a loaded machine can take a while just to spawn a process.
+	const hold = 10
+	script, captured := fakeForkingHelper(t, hold)
 	payload := []byte("copied on linux")
 
 	start := time.Now()
@@ -43,8 +49,9 @@ func TestWriteWithDetachesFromForkingHelper(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 
-	if elapsed > 1200*time.Millisecond {
-		t.Fatalf("detached write blocked for %s on a forking helper; it should return as soon as the foreground process exits", elapsed)
+	if elapsed > 4*time.Second {
+		t.Fatalf("detached write blocked for %s against a helper holding the streams for %ds; "+
+			"it should return as soon as the foreground process exits", elapsed, hold)
 	}
 	got, err := os.ReadFile(captured)
 	if err != nil {
@@ -61,7 +68,7 @@ func TestWriteWithoutDetachingBlocksOnForkingHelper(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing test")
 	}
-	script, _ := fakeForkingHelper(t)
+	script, _ := fakeForkingHelper(t, 2)
 
 	start := time.Now()
 	if err := writeWith(exec.Command(script), []byte("x"), false); err != nil {
