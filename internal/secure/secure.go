@@ -19,6 +19,7 @@ import (
 	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,6 +29,10 @@ import (
 const (
 	InfoSync      = "henri sync v1"
 	InfoDiscovery = "henri discovery v1"
+
+	// Labels for turning a recovery phrase into a group identity.
+	InfoMaster  = "henri master key v1"
+	InfoGroupID = "henri group id v1"
 )
 
 // ErrBadCiphertext is returned when a frame fails to authenticate. It never
@@ -80,6 +85,25 @@ func (b *Box) Open(sealed []byte) ([]byte, error) {
 		return nil, ErrBadCiphertext
 	}
 	return out, nil
+}
+
+// DeriveGroup turns the entropy behind a recovery phrase into the two things
+// that identify a clipboard group: its master key and its ID. Both come from
+// the same entropy, so the phrase alone is enough to rebuild a device's
+// membership — there is nothing else to write down.
+func DeriveGroup(entropy []byte) (groupID string, master []byte, err error) {
+	if len(entropy) < 16 {
+		return "", nil, fmt.Errorf("henri: need at least 16 bytes of entropy, got %d", len(entropy))
+	}
+	master, err = hkdf.Key(sha256.New, entropy, nil, InfoMaster, 32)
+	if err != nil {
+		return "", nil, err
+	}
+	id, err := hkdf.Key(sha256.New, entropy, nil, InfoGroupID, 8)
+	if err != nil {
+		return "", nil, err
+	}
+	return base64.RawURLEncoding.EncodeToString(id), master, nil
 }
 
 // Hash is the content fingerprint used to decide whether a clipboard payload is
