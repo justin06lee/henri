@@ -59,7 +59,11 @@ type Config struct {
 	Peers []string `json:"peers"`
 
 	PollMillis int `json:"poll_interval_ms"`
-	MaxBytes   int `json:"max_payload_bytes"`
+	// PollOnly disables event-driven clipboard watching and goes back to
+	// checking on a timer. Phrased as an opt-out so the default is the good
+	// one; set it if an event source misbehaves on your desktop.
+	PollOnly bool `json:"clipboard_poll_only,omitempty"`
+	MaxBytes int  `json:"max_payload_bytes"`
 }
 
 // Path returns the config file location, honouring $HENRI_CONFIG and

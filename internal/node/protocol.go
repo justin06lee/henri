@@ -62,14 +62,16 @@ type State struct {
 	Tool       string `json:"clipboard_tool"`
 	// ClipboardErr is non-empty when reads are failing -- usually a daemon
 	// running outside the graphical session.
-	ClipboardErr string     `json:"clipboard_error,omitempty"`
-	LastSyncAt   int64      `json:"last_sync_at"`
-	LastHash     string     `json:"last_hash"`
-	LastBytes    int        `json:"last_bytes"`
-	LastFrom     string     `json:"last_from"`
-	Sent         int64      `json:"sent"`
-	Received     int64      `json:"received"`
-	Peers        []PeerInfo `json:"peers"`
+	ClipboardErr string `json:"clipboard_error,omitempty"`
+	// WatchMode is how local copies are noticed: an event source, or a timer.
+	WatchMode  string     `json:"watch_mode,omitempty"`
+	LastSyncAt int64      `json:"last_sync_at"`
+	LastHash   string     `json:"last_hash"`
+	LastBytes  int        `json:"last_bytes"`
+	LastFrom   string     `json:"last_from"`
+	Sent       int64      `json:"sent"`
+	Received   int64      `json:"received"`
+	Peers      []PeerInfo `json:"peers"`
 }
 
 // PeerInfo describes one known device.
