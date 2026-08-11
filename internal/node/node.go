@@ -43,6 +43,7 @@ type Node struct {
 	lastBytes int
 	lastFrom  string
 	lastSync  time.Time
+	clipErr   string // why the last clipboard read failed, if it did
 
 	sent     atomic.Int64
 	received atomic.Int64
@@ -160,7 +161,24 @@ func (n *Node) watch(ctx context.Context) {
 		data, err := n.clip.Read()
 		if err != nil {
 			n.log.Debug("clipboard read failed", "err", err)
+			n.mu.Lock()
+			first := n.clipErr == ""
+			n.clipErr = err.Error()
+			n.mu.Unlock()
+			// Worth saying out loud once: a service started outside the
+			// graphical session finds the helper but cannot reach the display,
+			// and would otherwise just sit there syncing nothing.
+			if first {
+				n.log.Warn("cannot read the clipboard", "err", err)
+			}
 			continue
+		}
+		n.mu.Lock()
+		recovered := n.clipErr != ""
+		n.clipErr = ""
+		n.mu.Unlock()
+		if recovered {
+			n.log.Info("clipboard is readable again")
 		}
 		if len(data) == 0 {
 			continue
@@ -387,23 +405,25 @@ func (n *Node) pushCurrent() error {
 func (n *Node) state() *State {
 	n.mu.Lock()
 	lastHash, lastBytes, lastFrom, lastSync := n.lastHash, n.lastBytes, n.lastFrom, n.lastSync
+	clipErr := n.clipErr
 	n.mu.Unlock()
 
 	st := &State{
-		Device:     n.cfg.DeviceID,
-		Name:       n.cfg.DeviceName,
-		Group:      n.cfg.GroupID,
-		PID:        os.Getpid(),
-		StartedAt:  n.startedAt.UnixMilli(),
-		ListenPort: n.cfg.ListenPort,
-		Discovery:  n.cfg.Discovery,
-		Tool:       n.clip.Name(),
-		LastHash:   lastHash,
-		LastBytes:  lastBytes,
-		LastFrom:   lastFrom,
-		Sent:       n.sent.Load(),
-		Received:   n.received.Load(),
-		Peers:      n.peers.list(),
+		Device:       n.cfg.DeviceID,
+		Name:         n.cfg.DeviceName,
+		Group:        n.cfg.GroupID,
+		PID:          os.Getpid(),
+		StartedAt:    n.startedAt.UnixMilli(),
+		ListenPort:   n.cfg.ListenPort,
+		Discovery:    n.cfg.Discovery,
+		Tool:         n.clip.Name(),
+		ClipboardErr: clipErr,
+		LastHash:     lastHash,
+		LastBytes:    lastBytes,
+		LastFrom:     lastFrom,
+		Sent:         n.sent.Load(),
+		Received:     n.received.Load(),
+		Peers:        n.peers.list(),
 	}
 	if !lastSync.IsZero() {
 		st.LastSyncAt = lastSync.UnixMilli()

@@ -1,0 +1,155 @@
+// Package service installs henri into whatever runs background programs on
+// this machine, so the daemon starts at login and stays out of the way.
+//
+// On macOS that is a launchd LaunchAgent, on Linux a systemd user unit. Both
+// are per-user on purpose: the clipboard belongs to a graphical session, so a
+// system-wide service running as root would have nothing to read or write.
+package service
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+)
+
+// Label identifies henri to the service manager.
+const Label = "henri"
+
+// ErrUnsupported means this platform has no integration yet.
+var ErrUnsupported = errors.New("service: henri does not know how to install a background service on this system")
+
+// Status describes henri's presence in the service manager.
+type Status struct {
+	Manager   string // "launchd" or "systemd"
+	Installed bool   // the unit file is on disk
+	Enabled   bool   // it will come back at login
+	Running   bool   // it is running right now
+	UnitPath  string
+	LogHint   string // how to read the logs
+	Detail    string // whatever the service manager said
+}
+
+// Manager installs and controls the background service.
+type Manager interface {
+	// Install writes the unit for binary and starts it. It is idempotent:
+	// running it again updates the unit and restarts.
+	Install(binary string) error
+	Uninstall() error
+	Restart() error
+	Status() (Status, error)
+	UnitPath() string
+	Name() string
+}
+
+// New returns the manager for this platform.
+func New() (Manager, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return newLaunchd()
+	case "linux", "freebsd":
+		return newSystemd()
+	default:
+		return nil, ErrUnsupported
+	}
+}
+
+// BinaryPath returns the absolute, symlink-free path of the running henri, so
+// the unit points at a real file rather than whatever was on $PATH at the time.
+func BinaryPath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Abs(exe)
+}
+
+// sessionEnv captures the handful of variables the clipboard helpers need.
+//
+// This matters on Linux. `henri service install` is run from a terminal inside
+// the graphical session, so it can see DISPLAY and WAYLAND_DISPLAY; the systemd
+// user manager frequently cannot, because importing them is left to the desktop
+// environment and plenty of setups never do it. Recording them in the unit
+// means the service works whether or not the session bothers.
+func sessionEnv() map[string]string {
+	out := make(map[string]string)
+	for _, k := range []string{"WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY"} {
+		if v := os.Getenv(k); v != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// configEnv captures the variables that decide where henri looks for its
+// config. A service manager starts with a bare environment, so without these a
+// user who points HENRI_CONFIG or XDG_CONFIG_HOME somewhere would get a
+// background daemon quietly reading a different file than their shell does.
+func configEnv() map[string]string {
+	out := make(map[string]string)
+	for _, k := range []string{"HENRI_CONFIG", "XDG_CONFIG_HOME"} {
+		if v := os.Getenv(k); v != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// sortedKeys gives map iteration a stable order so regenerating a unit does not
+// churn the file.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// run executes a command and folds its output into any error, since service
+// managers put the useful part on stderr.
+func run(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		if text != "" {
+			return text, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, text)
+		}
+		return text, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return text, nil
+}
+
+// writeUnit writes a unit file, creating its directory.
+func writeUnit(path, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// VolatileLocation reports why path is a poor thing to point a login service
+// at, or "" if it looks stable.
+//
+// A service records one exact path and runs it forever after. A binary on an
+// external drive means henri fails to start every time the drive is not
+// plugged in, which looks like henri being broken rather than absent.
+func VolatileLocation(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/Volumes/"):
+		return "an external volume"
+	case strings.HasPrefix(path, "/media/"), strings.HasPrefix(path, "/mnt/"), strings.HasPrefix(path, "/run/media/"):
+		return "a mounted volume"
+	case strings.HasPrefix(path, "/tmp/"), strings.HasPrefix(path, "/private/tmp/"), strings.HasPrefix(path, "/var/tmp/"):
+		return "a temporary directory"
+	}
+	return ""
+}

@@ -52,21 +52,24 @@ type Message struct {
 
 // State is what `henri status` prints.
 type State struct {
-	Device     string     `json:"device"`
-	Name       string     `json:"name"`
-	Group      string     `json:"group"`
-	PID        int        `json:"pid"`
-	StartedAt  int64      `json:"started_at"`
-	ListenPort int        `json:"listen_port"`
-	Discovery  bool       `json:"discovery"`
-	Tool       string     `json:"clipboard_tool"`
-	LastSyncAt int64      `json:"last_sync_at"`
-	LastHash   string     `json:"last_hash"`
-	LastBytes  int        `json:"last_bytes"`
-	LastFrom   string     `json:"last_from"`
-	Sent       int64      `json:"sent"`
-	Received   int64      `json:"received"`
-	Peers      []PeerInfo `json:"peers"`
+	Device     string `json:"device"`
+	Name       string `json:"name"`
+	Group      string `json:"group"`
+	PID        int    `json:"pid"`
+	StartedAt  int64  `json:"started_at"`
+	ListenPort int    `json:"listen_port"`
+	Discovery  bool   `json:"discovery"`
+	Tool       string `json:"clipboard_tool"`
+	// ClipboardErr is non-empty when reads are failing -- usually a daemon
+	// running outside the graphical session.
+	ClipboardErr string     `json:"clipboard_error,omitempty"`
+	LastSyncAt   int64      `json:"last_sync_at"`
+	LastHash     string     `json:"last_hash"`
+	LastBytes    int        `json:"last_bytes"`
+	LastFrom     string     `json:"last_from"`
+	Sent         int64      `json:"sent"`
+	Received     int64      `json:"received"`
+	Peers        []PeerInfo `json:"peers"`
 }
 
 // PeerInfo describes one known device.

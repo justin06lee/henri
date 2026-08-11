@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -22,10 +23,11 @@ import (
 	"github.com/justin06lee/henri/internal/config"
 	"github.com/justin06lee/henri/internal/mnemonic"
 	"github.com/justin06lee/henri/internal/node"
+	"github.com/justin06lee/henri/internal/service"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.3.1"
+var version = "0.4.0"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
@@ -59,6 +61,8 @@ func run(args []string) error {
 		return cmdSend()
 	case "leave", "forget":
 		return cmdLeave(args[1:])
+	case "service":
+		return cmdService(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("henri " + version)
 		return nil
@@ -80,6 +84,7 @@ usage: henri <command> [flags]
   join <words>    join an existing group using its recovery phrase
   code            print this group's recovery phrase
   daemon          run the sync daemon in the foreground
+  service         run henri in the background, starting at login
   status          show what the local daemon is doing
   peers           list known devices; ` + "`peers add|rm <host:port>`" + ` to edit
   send            re-send the current clipboard to the group
@@ -273,7 +278,7 @@ func cmdDaemon(args []string) error {
 		return err
 	}
 
-	cfg, err := config.Load()
+	cfg, err := loadConfigWatched()
 	if err != nil {
 		return err
 	}
@@ -299,6 +304,45 @@ func cmdDaemon(args []string) error {
 	return nil
 }
 
+// loadConfigWatched reads the config, complaining if it takes suspiciously long.
+//
+// Opening a file normally returns in microseconds. When it does not, the config
+// is usually on a volume that is not answering -- an unmounted external disk, a
+// network mount, or on macOS a removable volume whose access prompt nothing is
+// present to accept. Without this the daemon just hangs with an empty log,
+// which is a miserable thing to debug.
+func loadConfigWatched() (*config.Config, error) {
+	type result struct {
+		cfg *config.Config
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		cfg, err := config.Load()
+		done <- result{cfg, err}
+	}()
+
+	warn := time.NewTimer(10 * time.Second)
+	defer warn.Stop()
+	for {
+		select {
+		case r := <-done:
+			return r.cfg, r.err
+		case <-warn.C:
+			path, _ := config.Path()
+			resolved, _ := config.ResolvedPath()
+			fmt.Fprintf(os.Stderr, "henri: still waiting to read %s after 10s.\n", path)
+			if resolved != "" && resolved != path {
+				fmt.Fprintf(os.Stderr, "       It resolves to %s\n", resolved)
+			}
+			fmt.Fprintf(os.Stderr, "       If that is on an external or network volume, it may not be\n")
+			fmt.Fprintf(os.Stderr, "       mounted, or the system may be waiting on a permission prompt\n")
+			fmt.Fprintf(os.Stderr, "       that a background service cannot answer.\n")
+			warn.Reset(60 * time.Second)
+		}
+	}
+}
+
 // --- status ----------------------------------------------------------------
 
 func cmdStatus() error {
@@ -313,6 +357,7 @@ func cmdStatus() error {
 			fmt.Printf("  device   %s\n", cfg.DeviceName)
 			fmt.Printf("  group    %s\n\n", cfg.GroupID)
 			fmt.Printf("Start it with:  henri daemon\n")
+			fmt.Printf("Or in the background at login:  henri service install\n")
 			return nil
 		}
 		return err
@@ -325,7 +370,11 @@ func cmdStatus() error {
 	fmt.Printf("henri  ● running\n\n")
 	fmt.Printf("  device     %s  (%s)\n", st.Name, st.Device)
 	fmt.Printf("  group      %s\n", st.Group)
-	fmt.Printf("  clipboard  %s\n", st.Tool)
+	if st.ClipboardErr != "" {
+		fmt.Printf("  clipboard  %s  ⚠ not readable: %s\n", st.Tool, st.ClipboardErr)
+	} else {
+		fmt.Printf("  clipboard  %s\n", st.Tool)
+	}
 	fmt.Printf("  listening  :%d   discovery %s\n", st.ListenPort, onOff(st.Discovery))
 	fmt.Printf("  uptime     %s   pid %d\n", since(st.StartedAt), st.PID)
 	fmt.Printf("  traffic    %d sent · %d received\n", st.Sent, st.Received)
@@ -536,6 +585,184 @@ func confirm(question string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// --- service ---------------------------------------------------------------
+
+func cmdService(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: henri service <install|uninstall|restart|status|logs>")
+	}
+	mgr, err := service.New()
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "install", "enable":
+		fs := flag.NewFlagSet("service install", flag.ContinueOnError)
+		force := fs.Bool("force", false, "install even if the binary is somewhere that may not always be there")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return cmdServiceInstall(mgr, *force)
+	case "uninstall", "remove", "disable":
+		return cmdServiceUninstall(mgr)
+	case "restart":
+		if err := mgr.Restart(); err != nil {
+			return err
+		}
+		fmt.Println("Restarted.")
+		return nil
+	case "status":
+		return cmdServiceStatus(mgr)
+	case "logs":
+		return cmdServiceLogs(mgr)
+	default:
+		return fmt.Errorf("unknown service command %q (try install, uninstall, restart, status or logs)", args[0])
+	}
+}
+
+func cmdServiceInstall(mgr service.Manager, force bool) error {
+	// Installing a service that immediately exits for want of a config is a
+	// confusing way to find out.
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	binary, err := service.BinaryPath()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Installing henri as a %s service.\n\n", mgr.Name())
+	fmt.Printf("  binary   %s\n", binary)
+	fmt.Printf("  unit     %s\n\n", mgr.UnitPath())
+
+	if why := service.VolatileLocation(binary); why != "" && !force {
+		fmt.Printf("  ⚠  That binary is on %s. The service runs this exact path, so\n", why)
+		fmt.Printf("     henri would fail to start whenever it is not mounted.\n\n")
+		fmt.Printf("     Install it somewhere permanent first, then install the service\n")
+		fmt.Printf("     from there:\n\n")
+		fmt.Printf("         make build && sudo make install\n")
+		fmt.Printf("         %s/bin/henri service install\n\n", "/usr/local")
+		return errors.New("refusing to point a login service at a volatile path (use -force to insist)")
+	}
+
+	// The config matters as much as the binary. `~/.config` is very often a
+	// symlink into a dotfiles directory, and if that lands on removable media
+	// the daemon cannot read it at login: the volume may not be mounted yet,
+	// and macOS gates removable volumes behind a consent prompt that a headless
+	// service has no way to answer. The open() simply blocks forever.
+	if resolved, rerr := config.ResolvedPath(); rerr == nil {
+		if why := service.VolatileLocation(resolved); why != "" && !force {
+			logical, _ := config.Path()
+			fmt.Printf("  ⚠  Your config lives on %s.\n\n", why)
+			if logical != resolved {
+				fmt.Printf("       %s\n     is really %s\n\n", logical, resolved)
+			}
+			fmt.Printf("     A service started at login cannot count on that being readable:\n")
+			fmt.Printf("     the volume may not be mounted yet, and macOS gates removable\n")
+			fmt.Printf("     volumes behind a permission prompt that nothing is there to answer.\n\n")
+			fmt.Printf("     Move it somewhere on the internal disk and point henri at it:\n\n")
+			fmt.Printf("         mkdir -p ~/.henri && mv %s ~/.henri/config.json\n", logical)
+			fmt.Printf("         export HENRI_CONFIG=$HOME/.henri/config.json   # add to your shell rc\n")
+			fmt.Printf("         henri service install\n\n")
+			fmt.Printf("     (install records HENRI_CONFIG in the service, so it will follow.)\n")
+			return errors.New("refusing to install a login service that cannot reach its config (use -force to insist)")
+		}
+	}
+
+	if err := mgr.Install(binary); err != nil {
+		return err
+	}
+
+	// Confirm it actually came up rather than claiming success and leaving the
+	// user to discover otherwise.
+	fmt.Printf("Waiting for it to start")
+	var up bool
+	for i := 0; i < 20; i++ {
+		time.Sleep(250 * time.Millisecond)
+		if _, err := node.Query(cfg, node.KindStatus); err == nil {
+			up = true
+			break
+		}
+		fmt.Print(".")
+	}
+	fmt.Println()
+
+	st, _ := mgr.Status()
+	if !up {
+		fmt.Printf("\nInstalled, but it has not answered yet.\n")
+		if st.Detail != "" {
+			fmt.Printf("  %s reports: %s\n", mgr.Name(), st.Detail)
+		}
+		fmt.Printf("\nCheck the logs:  %s\n", st.LogHint)
+		return nil
+	}
+
+	fmt.Printf("\nhenri is running in the background and will start again at login.\n\n")
+	fmt.Printf("  henri status          see what it is doing\n")
+	fmt.Printf("  henri service logs    follow its output\n")
+	fmt.Printf("  henri service uninstall\n\n")
+	fmt.Printf("The service points at that exact binary — reinstall if you move it.\n")
+	return nil
+}
+
+func cmdServiceUninstall(mgr service.Manager) error {
+	st, _ := mgr.Status()
+	if !st.Installed {
+		fmt.Println("No henri service is installed.")
+		return nil
+	}
+	if err := mgr.Uninstall(); err != nil {
+		return err
+	}
+	fmt.Printf("Removed the %s service. henri no longer starts at login.\n", mgr.Name())
+	fmt.Printf("Your config and group are untouched — `henri daemon` still works.\n")
+	return nil
+}
+
+func cmdServiceStatus(mgr service.Manager) error {
+	st, err := mgr.Status()
+	if err != nil {
+		return err
+	}
+	mark := func(b bool) string {
+		if b {
+			return "yes"
+		}
+		return "no"
+	}
+	fmt.Printf("henri service\n\n")
+	fmt.Printf("  manager    %s\n", st.Manager)
+	fmt.Printf("  installed  %s\n", mark(st.Installed))
+	fmt.Printf("  at login   %s\n", mark(st.Enabled))
+	fmt.Printf("  running    %s\n", mark(st.Running))
+	fmt.Printf("  unit       %s\n", st.UnitPath)
+	fmt.Printf("  logs       %s\n", st.LogHint)
+	if st.Detail != "" {
+		fmt.Printf("  detail     %s\n", st.Detail)
+	}
+	if !st.Installed {
+		fmt.Printf("\nInstall it with:  henri service install\n")
+	}
+	return nil
+}
+
+func cmdServiceLogs(mgr service.Manager) error {
+	st, err := mgr.Status()
+	if err != nil {
+		return err
+	}
+	parts := strings.Fields(st.LogHint)
+	if len(parts) == 0 {
+		return errors.New("no log command for this platform")
+	}
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
 }
 
 // --- helpers ---------------------------------------------------------------
