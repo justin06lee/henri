@@ -32,6 +32,17 @@ var ErrUnsupported = errors.New("clipboard: no supported clipboard tool found")
 // watch loop forever.
 const timeout = 5 * time.Second
 
+// waitDelay is how long Wait may keep waiting on the helper's output after the
+// deadline has already killed it.
+//
+// Killing the process is not enough on its own. Any child it left behind
+// inherits our end of the stdout pipe, and Wait stays blocked until every
+// writer closes it -- so a helper that forks and hangs made the read outlast
+// the timeout by as long as the child cared to live. This is the same trap
+// writeWith avoids by detaching entirely; here we still want the output, so we
+// take it up to the point where waiting stops being worth it.
+const waitDelay = time.Second
+
 // tool describes how to drive one clipboard helper.
 type tool struct {
 	// name is what shows up in `henri status`.
@@ -51,6 +62,16 @@ type tool struct {
 	// needBins must all exist on PATH for this tool to be usable.
 	needBins []string
 
+	// env is applied on top of the inherited environment for every call.
+	//
+	// This exists because pbcopy and pbpaste choose their text encoding from the
+	// locale variables, and fall back to plain C when there are none -- which
+	// silently mangles every accented character, curly quote, em-dash, CJK
+	// character and emoji in both directions. A daemon started by launchd
+	// inherits no LANG, LC_ALL or LC_CTYPE at all, so the environment we are
+	// handed cannot be trusted; we state what we need instead.
+	env []string
+
 	// forks is set for helpers that hand the selection to a background process
 	// and return. On X11 and Wayland the clipboard is owned by a live process
 	// rather than the display server, so xclip, xsel and wl-copy all daemonise
@@ -62,9 +83,11 @@ type tool struct {
 }
 
 var (
-	once     sync.Once
-	resolved *tool
-	resErr   error
+	resolveMu sync.Mutex
+	resolved  *tool
+	// resolvedFor records the WAYLAND_DISPLAY the cached pick was made under, so
+	// a session appearing later is noticed rather than ignored.
+	resolvedFor string
 )
 
 // candidates lists the tools to try, best first, for the current platform.
@@ -72,23 +95,45 @@ func candidates() []tool {
 	switch runtime.GOOS {
 	case "darwin":
 		return []tool{{
-			name:     "pbpaste",
-			readBin:  "pbpaste",
+			name:    "pbpaste",
+			readBin: "pbpaste",
+			// -Prefer txt keeps pbpaste on plain text. Left to itself it falls
+			// back to Encapsulated PostScript and then Rich Text when the
+			// pasteboard holds no plain flavour, so a copy out of an RTF-only
+			// app would sync `{\rtf1\ansi...}` to every peer.
+			readArgs: []string{"-Prefer", "txt"},
 			writeBin: "pbcopy",
 			needBins: []string{"pbpaste", "pbcopy"},
+			env:      []string{"LC_ALL=en_US.UTF-8"},
 		}}
 
 	case "windows":
 		ps := []string{"-NoProfile", "-NonInteractive", "-Command"}
-		return []tool{{
-			name:      "powershell",
-			readBin:   "powershell",
-			readArgs:  append(append([]string{}, ps...), "Get-Clipboard -Raw"),
-			writeBin:  "powershell",
-			writeArgs: append(append([]string{}, ps...), "Set-Clipboard -Value ([Console]::In.ReadToEnd())"),
-			needBins:  []string{"powershell"},
-			trimCRLF:  true,
-		}}
+		// Both halves state their encoding first. Get-Clipboard writes through
+		// [Console]::OutputEncoding, and [Console]::In.ReadToEnd() decodes our
+		// stdin with [Console]::InputEncoding; in powershell 5.1 both default to
+		// the OEM code page, which corrupts anything outside ASCII either way.
+		//
+		// The pipeline form rather than -Value: Set-Clipboard -Value '' throws
+		// "Cannot bind argument ... empty string" while -Command still exits 0,
+		// so clearing the clipboard would silently do nothing.
+		const readScript = `[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw`
+		const writeScript = `[Console]::InputEncoding=[Text.Encoding]::UTF8; [Console]::In.ReadToEnd() | Set-Clipboard`
+		var shells []tool
+		// pwsh first: PowerShell 7 is the one people install deliberately, and
+		// it defaults to UTF-8 rather than the code page.
+		for _, bin := range []string{"pwsh", "powershell"} {
+			shells = append(shells, tool{
+				name:      bin,
+				readBin:   bin,
+				readArgs:  append(append([]string{}, ps...), readScript),
+				writeBin:  bin,
+				writeArgs: append(append([]string{}, ps...), writeScript),
+				needBins:  []string{bin},
+				trimCRLF:  true,
+			})
+		}
+		return shells
 
 	default: // linux, freebsd, and the other X11/Wayland systems
 		wayland := tool{
@@ -105,26 +150,31 @@ func candidates() []tool {
 			needBins:    []string{"wl-paste", "wl-copy"},
 			forks:       true,
 		}
+		// -t UTF8_STRING and --utf8 for the same reason the Wayland candidate
+		// names a charset: X11's default target is XA_STRING, which is
+		// ISO-8859-1. Without asking, a read of anything with CJK, emoji or
+		// curly quotes comes back lossily converted, and a write is only
+		// published as STRING, so apps that ask for UTF8_STRING get nothing.
 		x11 := []tool{
 			{
 				name:        "xclip",
 				readBin:     "xclip",
-				readArgs:    []string{"-selection", "clipboard", "-o"},
+				readArgs:    []string{"-selection", "clipboard", "-t", "UTF8_STRING", "-o"},
 				primaryBin:  "xclip",
-				primaryArgs: []string{"-selection", "primary", "-o"},
+				primaryArgs: []string{"-selection", "primary", "-t", "UTF8_STRING", "-o"},
 				writeBin:    "xclip",
-				writeArgs:   []string{"-selection", "clipboard", "-i"},
+				writeArgs:   []string{"-selection", "clipboard", "-t", "UTF8_STRING", "-i"},
 				needBins:    []string{"xclip"},
 				forks:       true,
 			},
 			{
 				name:        "xsel",
 				readBin:     "xsel",
-				readArgs:    []string{"--clipboard", "--output"},
+				readArgs:    []string{"--clipboard", "--utf8", "--output"},
 				primaryBin:  "xsel",
-				primaryArgs: []string{"--primary", "--output"},
+				primaryArgs: []string{"--primary", "--utf8", "--output"},
 				writeBin:    "xsel",
-				writeArgs:   []string{"--clipboard", "--input"},
+				writeArgs:   []string{"--clipboard", "--utf8", "--input"},
 				needBins:    []string{"xsel"},
 				forks:       true,
 			},
@@ -140,22 +190,37 @@ func candidates() []tool {
 	}
 }
 
-// resolve picks a clipboard tool once and caches the result.
+// resolve picks a clipboard tool, caching success but never failure.
+//
+// Caching the failure was wrong under a service manager. launchd and systemd
+// start henri before the graphical session exists, so the first attempt can run
+// with no WAYLAND_DISPLAY set and, on a fresh machine, no helper on PATH at
+// all. Remembering either answer forever means henri prefers the wrong helper
+// for the rest of the session, or returns ErrUnsupported from every call even
+// after the user installs wl-clipboard. So a failure is simply retried, and a
+// success is dropped when the session type changes underneath us, since that is
+// what decides the preference order.
 func resolve() (*tool, error) {
-	once.Do(func() {
-		var tried []string
-		for _, c := range candidates() {
-			tried = append(tried, c.name)
-			if !hasAll(c.needBins) {
-				continue
-			}
-			t := c
-			resolved = &t
-			return
+	session := os.Getenv("WAYLAND_DISPLAY")
+
+	resolveMu.Lock()
+	defer resolveMu.Unlock()
+	if resolved != nil && resolvedFor == session {
+		return resolved, nil
+	}
+
+	var tried []string
+	for _, c := range candidates() {
+		tried = append(tried, c.name)
+		if !hasAll(c.needBins) {
+			continue
 		}
-		resErr = fmt.Errorf("%w (tried: %s)", ErrUnsupported, strings.Join(tried, ", "))
-	})
-	return resolved, resErr
+		t := c
+		resolved, resolvedFor = &t, session
+		return resolved, nil
+	}
+	resolved, resolvedFor = nil, ""
+	return nil, fmt.Errorf("%w (tried: %s)", ErrUnsupported, strings.Join(tried, ", "))
 }
 
 func hasAll(bins []string) bool {
@@ -192,15 +257,28 @@ func Read() ([]byte, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.readBin, t.readArgs...)
+	cmd.Env = append(os.Environ(), t.env...)
+	cmd.WaitDelay = waitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("clipboard: %s: timed out after %s", t.name, timeout)
+		}
 		// An empty clipboard, or one holding something that is not text, is not
 		// an error worth surfacing: there is simply nothing to sync. Several
 		// helpers report both by exiting non-zero.
-		if stdout.Len() == 0 && looksEmpty(stderr.String()) {
+		//
+		// But only where the helper actually said so. A helper that was killed,
+		// that is missing from PATH, or that failed without a word all produce
+		// exactly this shape -- no output, nothing on stderr -- and reporting
+		// that as an empty clipboard is how a permanently broken clipboard came
+		// to report itself healthy: the daemon reads nil as success, clears the
+		// recorded fault, logs that the clipboard is readable again, and stops
+		// syncing without ever warning anyone.
+		if stdout.Len() == 0 && strings.TrimSpace(stderr.String()) != "" && looksEmpty(stderr.String()) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("clipboard: %s: %w: %s", t.name, err, strings.TrimSpace(stderr.String()))
@@ -239,10 +317,16 @@ func ReadPrimary() ([]byte, error) {
 
 	var stdout, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, t.primaryBin, t.primaryArgs...)
+	cmd.Env = append(os.Environ(), t.env...)
+	cmd.WaitDelay = waitDelay
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		if stdout.Len() == 0 && looksEmpty(stderr.String()) {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("clipboard: %s: timed out after %s", t.name, timeout)
+		}
+		// Silence is not the same as "nothing is highlighted"; see Read.
+		if stdout.Len() == 0 && strings.TrimSpace(stderr.String()) != "" && looksEmpty(stderr.String()) {
 			return nil, nil // nothing highlighted
 		}
 		return nil, fmt.Errorf("clipboard: %s: %w: %s", t.name, err, strings.TrimSpace(stderr.String()))
@@ -266,6 +350,7 @@ func Write(data []byte) error {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.writeBin, t.writeArgs...)
+	cmd.Env = append(os.Environ(), t.env...)
 	if err := writeWith(cmd, data, t.forks); err != nil {
 		return fmt.Errorf("clipboard: write via %s: %w", t.name, err)
 	}
@@ -315,11 +400,11 @@ func looksEmpty(stderr string) bool {
 		return true
 	}
 	for _, phrase := range []string{
-		"no selection",       // xclip, xsel
-		"nothing is copied",  // wl-paste
-		"no suitable type",   // wl-paste, clipboard holds a non-text type
-		"empty",              // assorted
-		"selection is empty", //
+		"no selection",                     // xsel, when nobody owns the selection
+		"nothing is copied",                // wl-paste, empty clipboard
+		"no suitable type",                 // wl-paste, clipboard holds a non-text type
+		"target string not available",      // xclip, empty clipboard
+		"target utf8_string not available", // xclip, the target we actually ask for
 	} {
 		if strings.Contains(s, phrase) {
 			return true

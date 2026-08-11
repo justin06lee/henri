@@ -3,6 +3,7 @@ package clipboard
 import (
 	"bufio"
 	"context"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -105,6 +106,13 @@ func loopWatcher(ctx context.Context, name string, args ...string) chan struct{}
 		if err != nil {
 			return nil
 		}
+		// It finished inside the grace period, which happens whenever the
+		// selection changed while we were starting. Put the result back: the
+		// goroutine below waits on this same channel and would otherwise block
+		// on it forever, handing the caller a channel that never fires and
+		// never closes. The send cannot block, since the buffer of one was just
+		// emptied by this receive.
+		probeDone <- err
 	case <-time.After(startupGrace):
 		// Still blocking, which is exactly what it should do.
 	}
@@ -185,6 +193,15 @@ func hasDataControl() bool {
 // wasteful, it makes the screen flicker several times a second, which is worse
 // than not watching at all.
 func PollingStealsFocus() bool {
+	// With no Wayland session there is no focus to steal, and the probe below
+	// cannot tell "this compositor lacks data-control" from "there is no
+	// compositor": wl-paste dies either way. Guessing true costs the caller
+	// clipboard watching for the entire life of the process, which is exactly
+	// wrong on an X11 machine that merely has wl-clipboard installed, or in a
+	// service that started before the compositor did.
+	if os.Getenv("WAYLAND_DISPLAY") == "" {
+		return false
+	}
 	t, err := resolve()
 	if err != nil {
 		return false

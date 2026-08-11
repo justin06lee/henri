@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,18 +100,26 @@ func TestWriteWithReportsFailure(t *testing.T) {
 }
 
 func TestLooksEmpty(t *testing.T) {
-	empty := []string{
-		"",
-		"   ",
-		"Error: target STRING not available", // not matched below, see want=false
-		"xclip: No selection",
-		"wl-paste: Nothing is copied",
-		"No suitable type of content copied",
+	// "target STRING not available" used to be asserted as NOT empty, which is
+	// what xclip actually says about an ordinary empty clipboard -- so every
+	// empty clipboard on X11 surfaced as a hard error with a scary warning.
+	empty := map[string]bool{
+		"":                                     true,
+		"   ":                                  true,
+		"Error: target STRING not available":   true,
+		"Error: target UTF8_STRING not availa": false, // truncated, and rightly unmatched
+		"Error: target UTF8_STRING not available": true,
+		"xclip: No selection":                     true,
+		"wl-paste: Nothing is copied":             true,
+		"No suitable type of content copied":      true,
+		// Real failures, which must never be mistaken for an empty clipboard.
+		"Error: Can't open display: (null)":           false,
+		"wl-paste: failed to connect to a compositor": false,
+		"emptying the trash":                          false, // the bare "empty" match was this broad
 	}
-	want := []bool{true, true, false, true, true, true}
-	for i, s := range empty {
-		if got := looksEmpty(s); got != want[i] {
-			t.Errorf("looksEmpty(%q) = %v, want %v", s, got, want[i])
+	for s, want := range empty {
+		if got := looksEmpty(s); got != want {
+			t.Errorf("looksEmpty(%q) = %v, want %v", s, got, want)
 		}
 	}
 }
@@ -141,5 +150,186 @@ func TestCandidatesDeclareTheirBinaries(t *testing.T) {
 		if c.readBin == "" || c.writeBin == "" {
 			t.Errorf("%s is missing a read or write binary", c.name)
 		}
+	}
+}
+
+// useTool points the package at a helper of our own for one test.
+func useTool(t *testing.T, tl tool) {
+	t.Helper()
+	resolveMu.Lock()
+	prev, prevFor := resolved, resolvedFor
+	resolved, resolvedFor = &tl, os.Getenv("WAYLAND_DISPLAY")
+	resolveMu.Unlock()
+	t.Cleanup(func() {
+		resolveMu.Lock()
+		resolved, resolvedFor = prev, prevFor
+		resolveMu.Unlock()
+	})
+}
+
+// writeScript puts an executable /bin/sh script in dir.
+func writeScript(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The regression this guards is the one that hid everything else: a helper that
+// fails without a word produces no output and no stderr, which looked exactly
+// like an empty clipboard. Read then returned nil, nil, the daemon read that as
+// success, cleared the recorded fault and logged that the clipboard was
+// readable again -- so a permanently broken clipboard reported healthy and sync
+// simply stopped.
+func TestReadReportsSilentFailuresAsErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell")
+	}
+	dir := t.TempDir()
+
+	cases := []struct {
+		name    string
+		bin     string
+		wantErr bool
+	}{
+		{"silent non-zero exit", writeScript(t, dir, "silent", "exit 3\n"), true},
+		{"killed outright", writeScript(t, dir, "killed", "kill -9 $$\n"), true},
+		{"missing from PATH", filepath.Join(dir, "definitely-not-here"), true},
+		// These two stay as they were: a helper that says the clipboard is
+		// empty, and a helper that exits 0 with nothing to say, both mean there
+		// is nothing to sync.
+		{"helper says it is empty", writeScript(t, dir, "spoken", "echo 'Nothing is copied' >&2\nexit 1\n"), false},
+		{"clean exit, no output", writeScript(t, dir, "quiet", "exit 0\n"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			useTool(t, tool{name: "fake", readBin: c.bin, writeBin: c.bin})
+			out, err := Read()
+			switch {
+			case c.wantErr && err == nil:
+				t.Fatalf("Read returned (%q, nil); a failure must not be reported as an empty clipboard", out)
+			case !c.wantErr && err != nil:
+				t.Fatalf("Read returned %v, want an empty clipboard", err)
+			}
+		})
+	}
+}
+
+// A helper that never returns is a failure too, and one the caller especially
+// needs to hear about.
+func TestReadReportsATimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell")
+	}
+	if testing.Short() {
+		t.Skip("waits out the clipboard timeout")
+	}
+	dir := t.TempDir()
+	// The helper wedges and leaves a child holding our stdout pipe, which is
+	// what used to make Read outlast its own deadline by the child's lifetime.
+	useTool(t, tool{name: "fake", readBin: writeScript(t, dir, "wedged", "sleep 60 &\nsleep 60\n")})
+
+	start := time.Now()
+	if out, err := Read(); err == nil {
+		t.Fatalf("Read returned (%q, nil) after being killed at the deadline", out)
+	}
+	elapsed := time.Since(start)
+	if elapsed < timeout {
+		t.Errorf("Read gave up after %s, before the %s deadline", elapsed, timeout)
+	}
+	if elapsed > timeout+waitDelay+2*time.Second {
+		t.Errorf("Read took %s to give up on a %s deadline; the helper's child is still holding the pipe", elapsed, timeout)
+	}
+}
+
+// pbcopy and pbpaste choose their encoding from the locale, and a launchd job
+// inherits none -- so the candidate has to carry one itself.
+func TestDarwinCandidateSetsALocale(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	c := candidates()[0]
+	var found bool
+	for _, kv := range c.env {
+		if strings.HasPrefix(kv, "LC_ALL=") || strings.HasPrefix(kv, "LANG=") || strings.HasPrefix(kv, "LC_CTYPE=") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the %s candidate declares no locale (env = %v); non-ASCII text will be mangled under launchd", c.name, c.env)
+	}
+}
+
+// resetResolve clears the cached tool for the duration of one test.
+func resetResolve(t *testing.T) {
+	t.Helper()
+	resolveMu.Lock()
+	prev, prevFor := resolved, resolvedFor
+	resolved, resolvedFor = nil, ""
+	resolveMu.Unlock()
+	t.Cleanup(func() {
+		resolveMu.Lock()
+		resolved, resolvedFor = prev, prevFor
+		resolveMu.Unlock()
+	})
+}
+
+// A failure must never be remembered. Under launchd and systemd henri can start
+// before the graphical session exists and before anything is installed, and
+// caching that answer meant Read and Write returned ErrUnsupported for the rest
+// of the process -- long after the user had installed the helper.
+func TestResolveDoesNotCacheFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell")
+	}
+	resetResolve(t)
+
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	if _, err := resolve(); err == nil {
+		t.Fatal("resolve found a clipboard tool on an empty PATH")
+	}
+
+	// The user installs the helper while henri is running.
+	for _, bin := range candidates()[0].needBins {
+		writeScript(t, dir, bin, "exit 0\n")
+	}
+	if _, err := resolve(); err != nil {
+		t.Fatalf("resolve still fails after the helper appeared: %v", err)
+	}
+}
+
+// The session decides which helper is right, and under a service manager it
+// frequently arrives after henri does.
+func TestResolveRefreshesWhenTheSessionAppears(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("unix session selection only")
+	}
+	resetResolve(t)
+
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	for _, bin := range []string{"xclip", "xsel", "wl-paste", "wl-copy"} {
+		writeScript(t, dir, bin, "exit 0\n")
+	}
+
+	t.Setenv("WAYLAND_DISPLAY", "")
+	first, err := resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.name != "xclip" {
+		t.Fatalf("off Wayland resolve picked %q, want xclip", first.name)
+	}
+
+	t.Setenv("WAYLAND_DISPLAY", "wayland-0")
+	second, err := resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.name != "wl-clipboard" {
+		t.Fatalf("the Wayland session appeared and resolve still says %q", second.name)
 	}
 }
