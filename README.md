@@ -238,7 +238,7 @@ A few details that matter:
 
 **Changes are noticed, not hunted for.** Where the system will say when the
 clipboard changed, henri listens instead of asking: `wl-paste --watch` on
-Wayland, `clipnotify` on X11 if it is installed. Both mean henri touches the
+Wayland, GPaste's D-Bus signal on GNOME, `clipnotify` on X11 if it is installed. Both mean henri touches the
 clipboard only when something actually happened. `henri status` shows which one
 is in use.
 
@@ -413,6 +413,48 @@ different config.
 
 `-force` overrides either check if you know what you are doing.
 
+### GNOME Wayland
+
+GNOME is the one desktop that needs a hand, and it is worth knowing why.
+
+On X11 the clipboard was a property of the X server and any program could read
+it. Wayland deliberately removed that: the clipboard lives inside the
+compositor, and it is only handed to the client that currently holds **keyboard
+focus**. That is the security model — it stops a background process from
+silently reading everything you copy.
+
+Clipboard managers get around it with `wlr-data-control` or `ext-data-control`.
+wlroots compositors (Sway, Hyprland, river) and KDE implement one of them, and
+on those henri needs nothing extra. [Mutter implements
+neither](https://gitlab.gnome.org/GNOME/mutter/-/work_items/524), on the grounds
+that the protocol is exactly the hole Wayland set out to close. So on GNOME
+there is no way for henri to read the clipboard without briefly taking focus,
+and doing that on a timer makes the screen flicker.
+
+[GPaste](https://github.com/Keruspe/GPaste) is the sanctioned way out. It is a
+clipboard manager whose daemon is paired with a GNOME Shell extension, so the
+privileged half can watch the clipboard legitimately, and it publishes what it
+sees on D-Bus. henri reads from there and never touches the compositor:
+
+```sh
+sudo pacman -S gpaste          # arch
+sudo apt install gpaste        # debian, ubuntu
+```
+
+Then enable its GNOME Shell extension — GPaste ships one; turn it on in the
+Extensions app. Without the extension the daemon cannot see the clipboard on
+Wayland, and henri will read an empty history.
+
+henri picks it up on its own. Confirm with:
+
+```console
+$ henri status
+  clipboard  gpaste
+  watching   gpaste (D-Bus)
+```
+
+No polling, no focus stolen, changes delivered as they happen.
+
 ### If the screen flickers
 
 Symptom: windows flicker or focus jumps every half second while henri runs.
@@ -431,10 +473,12 @@ $ henri status
 If that second line reads `polling every 400ms`, henri could not find an event
 source:
 
-- **Wayland.** `wl-paste --watch` needs `wlr-data-control` (wlroots: Sway,
-  Hyprland, river) or `ext-data-control` (recent GNOME, KDE). If your compositor
-  has neither, there is no way to read the clipboard in the background without
-  taking focus, and the only lever is to poll less often.
+- **GNOME.** Install GPaste and enable its shell extension — see
+  [GNOME Wayland](#gnome-wayland) above. That is the whole fix.
+- **Other Wayland.** `wl-paste --watch` needs `wlr-data-control` (wlroots: Sway,
+  Hyprland, river) or `ext-data-control` (KDE). Without either, and without
+  GPaste, there is no way to read the clipboard in the background at all, and
+  the only lever is to poll less often.
 - **X11.** Install [`clipnotify`](https://github.com/cdown/clipnotify) — it
   blocks until the selection changes, so henri stops asking entirely.
 

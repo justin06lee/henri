@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,10 @@ func Events(ctx context.Context) (<-chan struct{}, string) {
 		return nil, ""
 	}
 	switch t.name {
+	case "gpaste":
+		if ch := gpasteEvents(ctx); ch != nil {
+			return ch, "gpaste (D-Bus)"
+		}
 	case "wl-clipboard":
 		// --watch needs wlr-data-control (or ext-data-control). Compositors
 		// that have it also let wl-paste read without focus, so this both
@@ -50,6 +55,12 @@ func Events(ctx context.Context) (<-chan struct{}, string) {
 // pipeWatcher runs a long-lived command that writes a line per clipboard
 // change, and turns those lines into channel sends.
 func pipeWatcher(ctx context.Context, name string, args ...string) chan struct{} {
+	return pipeWatcherFunc(ctx, func(string) bool { return true }, name, args...)
+}
+
+// pipeWatcherFunc is pipeWatcher for commands whose output carries lines we do
+// not care about, such as a general-purpose bus monitor.
+func pipeWatcherFunc(ctx context.Context, interesting func(string) bool, name string, args ...string) chan struct{} {
 	cmd := exec.CommandContext(ctx, name, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -78,6 +89,9 @@ func pipeWatcher(ctx context.Context, name string, args ...string) chan struct{}
 		defer close(ch)
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
+			if !interesting(scanner.Text()) {
+				continue
+			}
 			select {
 			case ch <- struct{}{}:
 			default: // a signal is already pending; one is as good as two
@@ -139,4 +153,43 @@ func signal(ch chan struct{}) {
 	case ch <- struct{}{}:
 	default:
 	}
+}
+
+var (
+	dataControlOnce sync.Once
+	dataControlOK   bool
+)
+
+// hasDataControl reports whether the compositor implements a clipboard-manager
+// protocol (wlr-data-control or ext-data-control).
+//
+// There is no way to ask directly through wl-clipboard, so this asks the only
+// question that matters: does `wl-paste --watch` survive being started? It
+// exits immediately when the protocol is missing. The answer decides whether
+// reading the clipboard costs keyboard focus, so it drives which backend henri
+// picks, not just how it watches.
+func hasDataControl() bool {
+	dataControlOnce.Do(func() {
+		if _, err := exec.LookPath("wl-paste"); err != nil {
+			return
+		}
+		cmd := exec.Command("wl-paste", "--watch", "echo")
+		if err := cmd.Start(); err != nil {
+			return
+		}
+		exited := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(exited)
+		}()
+		select {
+		case <-exited:
+			dataControlOK = false
+		case <-time.After(startupGrace):
+			dataControlOK = true
+			_ = cmd.Process.Kill()
+			<-exited
+		}
+	})
+	return dataControlOK
 }
