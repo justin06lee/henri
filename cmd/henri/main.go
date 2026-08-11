@@ -25,7 +25,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.3.0"
+var version = "0.3.1"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
