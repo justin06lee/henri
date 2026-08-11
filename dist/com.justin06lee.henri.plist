@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent for henri.
+
+  Install:
+    cp dist/com.justin06lee.henri.plist ~/Library/LaunchAgents/
+    # edit the henri path below if you did not install to /usr/local/bin
+    launchctl load -w ~/Library/LaunchAgents/com.justin06lee.henri.plist
+
+  Logs land in ~/Library/Logs/henri.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.justin06lee.henri</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/henri</string>
+    <string>daemon</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- henri needs the user's GUI session to reach the clipboard, so it runs as
+       a LaunchAgent (per-user), never as a LaunchDaemon (system-wide). -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/henri.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/henri.log</string>
+</dict>
+</plist>
