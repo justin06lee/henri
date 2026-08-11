@@ -44,17 +44,31 @@ whole idea.
 
 ## Install
 
+The simplest way, no root needed — it lands in `$(go env GOPATH)/bin`:
+
 ```sh
 go install github.com/justin06lee/henri/cmd/henri@latest
 ```
 
-Or build it from a clone:
+Or build it from a clone. Build as yourself, install as root:
 
 ```sh
 git clone https://github.com/justin06lee/henri
 cd henri
 make build          # ./henri
 sudo make install   # /usr/local/bin/henri
+```
+
+`make install` deliberately refuses to compile anything — it only copies the
+binary you already built. Running the compiler under `sudo` would scatter
+root-owned files through your working tree and break the next ordinary `make`,
+and on a repo git considers foreign (an external drive mounted `noowners`, a
+Docker bind mount owned by another uid) it fails outright.
+
+To skip root altogether, install somewhere you own:
+
+```sh
+make install PREFIX=$HOME/.local    # ~/.local/bin/henri
 ```
 
 **Linux** additionally needs a clipboard helper — `wl-clipboard` on Wayland, or
