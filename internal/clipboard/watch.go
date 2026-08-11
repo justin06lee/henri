@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -139,4 +140,54 @@ func signal(ch chan struct{}) {
 	case ch <- struct{}{}:
 	default:
 	}
+}
+
+var (
+	dataControlOnce sync.Once
+	dataControlOK   bool
+)
+
+// hasDataControl reports whether the compositor implements a clipboard-manager
+// protocol (wlr-data-control or ext-data-control).
+//
+// There is no way to ask wl-clipboard directly, so this asks the only question
+// that matters: does `wl-paste --watch` survive being started? It exits at once
+// when the protocol is missing.
+func hasDataControl() bool {
+	dataControlOnce.Do(func() {
+		if _, err := exec.LookPath("wl-paste"); err != nil {
+			return
+		}
+		cmd := exec.Command("wl-paste", "--watch", "echo")
+		if err := cmd.Start(); err != nil {
+			return
+		}
+		exited := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(exited) }()
+		select {
+		case <-exited:
+			dataControlOK = false
+		case <-time.After(startupGrace):
+			dataControlOK = true
+			_ = cmd.Process.Kill()
+			<-exited
+		}
+	})
+	return dataControlOK
+}
+
+// PollingStealsFocus reports whether every clipboard read costs keyboard focus
+// on this system.
+//
+// True on Wayland compositors that implement no data-control protocol. The core
+// protocol delivers the selection only to the client holding keyboard focus, so
+// wl-paste has to take focus to read anything. Polling there is not merely
+// wasteful, it makes the screen flicker several times a second, which is worse
+// than not watching at all.
+func PollingStealsFocus() bool {
+	t, err := resolve()
+	if err != nil {
+		return false
+	}
+	return t.name == "wl-clipboard" && !hasDataControl()
 }

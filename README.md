@@ -182,6 +182,9 @@ Lost the phrase? `henri code` prints it again on any device still in the group.
 | `henri peers add <host:port>` | Add a device that discovery can't reach |
 | `henri peers rm <host:port>` | Remove one |
 | `henri send` | Re-send the current clipboard to the group |
+| `henri hotkey install` | Bind a key to `henri send`, for desktops henri cannot watch |
+| `henri hotkey status` | Show the current binding |
+| `henri hotkey uninstall` | Remove it |
 | `henri leave` | Remove this device's config and leave the group |
 | `henri version` | Print the version |
 
@@ -413,6 +416,59 @@ different config.
 
 `-force` overrides either check if you know what you are doing.
 
+### Desktops henri cannot watch
+
+Some compositors will not let any background program read the clipboard. Wayland
+hands the selection only to the client holding keyboard focus, and where the
+compositor implements no data-control protocol there is no way around it:
+reading takes focus, and reading on a timer makes the screen flicker.
+
+henri detects that and **stops watching** rather than flickering at you. It says
+so plainly:
+
+```console
+$ henri status
+  clipboard  wl-clipboard
+  watching   press-to-send (this compositor cannot be watched in the background)
+
+This compositor only gives the clipboard to the focused window, so henri
+cannot notice copies on its own. Bind a key to push them:
+
+    henri hotkey install
+```
+
+That binds **Super+Shift+C** to `henri send`. Copy as usual, press the key when
+you want that copy on your other devices:
+
+```console
+$ henri hotkey install
+Bound Super+Shift+C to `henri send`.
+
+  command  /usr/local/bin/henri send
+```
+
+Receiving stays automatic — this only affects sending. Pick a different key with
+`-accel`, using GNOME's syntax:
+
+```sh
+henri hotkey install -accel '<Super><Alt>c'
+```
+
+henri can set the binding itself on GNOME. Everywhere else it prints the line to
+add to your compositor's config:
+
+```
+sway / i3      bindsym $mod+Shift+c exec /usr/local/bin/henri send
+hyprland       bind = SUPER SHIFT, C, exec, /usr/local/bin/henri send
+```
+
+If you would rather have automatic syncing and can live with the flicker, poll
+anyway:
+
+```json
+"clipboard_poll_only": true
+```
+
 ### If the screen flickers
 
 Symptom: windows flicker or focus jumps every half second while henri runs.
@@ -444,9 +500,9 @@ source:
 - **GNOME Wayland specifically.** [Mutter implements
   neither](https://gitlab.gnome.org/GNOME/mutter/-/work_items/524), deliberately
   — a protocol that lets any background process read the clipboard is the hole
-  Wayland set out to close. So there is no fix here, only tradeoffs: poll less
-  often and live with a slower flicker, or run henri on X11 where the clipboard
-  is readable without taking focus.
+  Wayland set out to close. henri does not poll there at all; see
+  [Desktops henri cannot watch](#desktops-henri-cannot-watch) for the hotkey,
+  or run henri on X11 where the clipboard is readable without taking focus.
 
   XWayland is not a way around it. GNOME bridges the two clipboards, but only
   in one direction: an X11 client cannot see what a Wayland client copied
