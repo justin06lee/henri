@@ -252,3 +252,16 @@ func TestRemoveWithoutAConfigReportsIt(t *testing.T) {
 		t.Fatal("removing a config that does not exist reported success")
 	}
 }
+
+// The default phrase length is a product decision, not an accident: check it
+// stays put.
+func TestDefaultPhraseIsFifteenWords(t *testing.T) {
+	withTempConfig(t)
+	cfg, err := New("laptop", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Fields(cfg.Phrase)); got != 15 {
+		t.Fatalf("the default phrase is %d words, want 15", got)
+	}
+}

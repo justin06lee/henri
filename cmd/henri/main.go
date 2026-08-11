@@ -25,7 +25,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.2.0"
+var version = "0.3.0"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
@@ -97,14 +97,16 @@ func cmdInit(args []string) error {
 	name := fs.String("name", defaultDeviceName(), "name for this device")
 	port := fs.Int("port", config.DefaultListenPort, "TCP port to receive clipboard updates on")
 	discovery := fs.Bool("discovery", true, "find other devices on the LAN automatically")
-	words := fs.Int("words", 12, "length of the recovery phrase (12, 15, 18, 21 or 24)")
+	words := fs.Int("words", 15, "length of the recovery phrase (12, 15, 18, 21 or 24)")
 	force := fs.Bool("force", false, "overwrite an existing config")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	bits, ok := mnemonic.EntropyBitsFor(*words)
 	if !ok {
-		return fmt.Errorf("-words must be 12, 15, 18, 21 or 24, not %d", *words)
+		return fmt.Errorf("-words must be 12, 15, 18, 21 or 24, not %d — a phrase length is "+
+			"always a multiple of three, because each word carries 11 bits and the checksum "+
+			"is a 32nd of the entropy", *words)
 	}
 
 	path, err := config.Path()
