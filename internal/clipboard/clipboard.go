@@ -44,12 +44,6 @@ type tool struct {
 	writeArgs []string
 	// needBins must all exist on PATH for this tool to be usable.
 	needBins []string
-	// usable is an extra runtime check, for backends that need more than a
-	// binary on PATH -- a daemon answering, say.
-	usable func() bool
-	// readCustom replaces readBin/readArgs for backends that need more than
-	// one command to produce the clipboard.
-	readCustom func() ([]byte, error)
 
 	// forks is set for helpers that hand the selection to a background process
 	// and return. On X11 and Wayland the clipboard is owned by a live process
@@ -124,34 +118,11 @@ func candidates() []tool {
 			},
 		}
 
-		// GNOME implements neither clipboard-manager protocol, so wl-paste has
-		// to take keyboard focus to read anything. GPaste is the sanctioned way
-		// out on that desktop: a privileged daemon watches the clipboard and
-		// publishes it on D-Bus, so henri never touches the compositor.
-		gpaste := tool{
-			name:       "gpaste",
-			readCustom: gpasteRead,
-			readBin:    "gpaste-client", // for Tool() and diagnostics
-			// Writing still goes through wl-copy: gpaste-client takes its input
-			// on stdin too, but wl-copy is the path already proven here.
-			writeBin:  "wl-copy",
-			writeArgs: []string{"--type", "text/plain;charset=utf-8", "--"},
-			needBins:  []string{"gpaste-client", "gdbus", "wl-copy"},
-			usable:    gpasteAvailable,
-			forks:     true,
-		}
-
 		// Prefer whichever matches the session actually in use: on a Wayland
 		// session xclip may exist but talk to an XWayland clipboard the
 		// compositor does not share, and on X11 wl-paste simply fails.
 		if os.Getenv("WAYLAND_DISPLAY") != "" {
-			// wl-clipboard first, but only where the compositor can serve it
-			// without stealing focus. Otherwise GPaste, then wl-clipboard
-			// anyway as a last resort.
-			if hasDataControl() {
-				return append([]tool{wayland}, x11...)
-			}
-			return append([]tool{gpaste, wayland}, x11...)
+			return append([]tool{wayland}, x11...)
 		}
 		return append(x11, wayland)
 	}
@@ -164,9 +135,6 @@ func resolve() (*tool, error) {
 		for _, c := range candidates() {
 			tried = append(tried, c.name)
 			if !hasAll(c.needBins) {
-				continue
-			}
-			if c.usable != nil && !c.usable() {
 				continue
 			}
 			t := c
@@ -208,10 +176,6 @@ func Read() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if t.readCustom != nil {
-		return t.readCustom()
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
