@@ -21,13 +21,14 @@ import (
 
 	"github.com/justin06lee/henri/internal/clipboard"
 	"github.com/justin06lee/henri/internal/config"
+	"github.com/justin06lee/henri/internal/hotkey"
 	"github.com/justin06lee/henri/internal/mnemonic"
 	"github.com/justin06lee/henri/internal/node"
 	"github.com/justin06lee/henri/internal/service"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.7.0"
+var version = "0.8.0"
 
 // codePrefix tags a join code so a mistyped paste fails early and clearly.
 const codePrefix = "henri1:"
@@ -63,6 +64,8 @@ func run(args []string) error {
 		return cmdLeave(args[1:])
 	case "service":
 		return cmdService(args[1:])
+	case "hotkey", "key":
+		return cmdHotkey(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("henri " + version)
 		return nil
@@ -85,6 +88,7 @@ usage: henri <command> [flags]
   code            print this group's recovery phrase
   daemon          run the sync daemon in the foreground
   service         run henri in the background, starting at login
+  hotkey          bind a key to ` + "`henri send`" + `, for desktops henri cannot watch
   status          show what the local daemon is doing
   peers           list known devices; ` + "`peers add|rm <host:port>`" + ` to edit
   send            re-send the current clipboard to the group
@@ -377,6 +381,13 @@ func cmdStatus() error {
 	}
 	if st.WatchMode != "" {
 		fmt.Printf("  watching   %s\n", st.WatchMode)
+	}
+	if strings.HasPrefix(st.WatchMode, "press-to-send") {
+		defer func() {
+			fmt.Printf("\nThis compositor only gives the clipboard to the focused window, so henri\n")
+			fmt.Printf("cannot notice copies on its own. Bind a key to push them:\n\n")
+			fmt.Printf("    henri hotkey install\n")
+		}()
 	}
 	fmt.Printf("  listening  :%d   discovery %s\n", st.ListenPort, onOff(st.Discovery))
 	fmt.Printf("  uptime     %s   pid %d\n", since(st.StartedAt), st.PID)
@@ -766,6 +777,83 @@ func cmdServiceLogs(mgr service.Manager) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	return cmd.Run()
+}
+
+// --- hotkey ----------------------------------------------------------------
+
+func cmdHotkey(args []string) error {
+	if len(args) == 0 {
+		args = []string{"status"}
+	}
+	fs := flag.NewFlagSet("hotkey", flag.ContinueOnError)
+	accel := fs.String("accel", hotkey.DefaultAccel, "the shortcut to bind, in GNOME accelerator syntax")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	switch args[0] {
+	case "install", "add", "enable":
+		return cmdHotkeyInstall(*accel)
+	case "uninstall", "remove", "disable":
+		if err := hotkey.Uninstall(); err != nil {
+			if errors.Is(err, hotkey.ErrManual) {
+				return fmt.Errorf("henri did not set up a shortcut on %s, so there is nothing to remove", hotkey.Desktop())
+			}
+			return err
+		}
+		fmt.Println("Removed henri's shortcut.")
+		return nil
+	case "status":
+		return cmdHotkeyStatus(*accel)
+	default:
+		return fmt.Errorf("unknown hotkey command %q (try install, uninstall or status)", args[0])
+	}
+}
+
+func cmdHotkeyInstall(accel string) error {
+	binary, err := service.BinaryPath()
+	if err != nil {
+		return err
+	}
+	command := binary + " send"
+
+	if err := hotkey.Install(command, accel); err != nil {
+		if errors.Is(err, hotkey.ErrManual) {
+			fmt.Printf("henri cannot set shortcuts on %s automatically.\n\n", hotkey.Desktop())
+			fmt.Print(hotkey.Instructions(command, accel))
+			return nil
+		}
+		return err
+	}
+
+	fmt.Printf("Bound %s to `henri send`.\n\n", hotkey.Human(accel))
+	fmt.Printf("  command  %s\n\n", command)
+	fmt.Printf("Copy as usual, then press %s to push it to your other devices.\n", hotkey.Human(accel))
+	fmt.Printf("Receiving stays automatic — this is only needed for sending.\n")
+	return nil
+}
+
+func cmdHotkeyStatus(accel string) error {
+	st, err := hotkey.Get()
+	if err != nil && !errors.Is(err, hotkey.ErrManual) {
+		return err
+	}
+	fmt.Printf("henri hotkey\n\n")
+	fmt.Printf("  desktop    %s\n", st.Desktop)
+	if errors.Is(err, hotkey.ErrManual) {
+		binary, _ := service.BinaryPath()
+		fmt.Printf("  managed    no — henri cannot script shortcuts here\n\n")
+		fmt.Print(hotkey.Instructions(binary+" send", accel))
+		return nil
+	}
+	if !st.Installed {
+		fmt.Printf("  bound      no\n\n")
+		fmt.Printf("Bind one with:  henri hotkey install\n")
+		return nil
+	}
+	fmt.Printf("  bound      %s\n", hotkey.Human(st.Accel))
+	fmt.Printf("  command    %s\n", st.Command)
+	return nil
 }
 
 // --- helpers ---------------------------------------------------------------

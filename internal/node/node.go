@@ -167,6 +167,18 @@ func (n *Node) watch(ctx context.Context) {
 			// slow tick purely so a dropped event cannot leave this device out
 			// of sync indefinitely.
 			interval = 30 * time.Second
+		} else if clipboard.PollingStealsFocus() {
+			// Reading costs keyboard focus here, so polling would flicker the
+			// screen a few times a second. Watching nothing is the better of
+			// two bad options; `henri send`, on a key, costs one read when
+			// asked for.
+			n.setWatchMode("press-to-send (this compositor cannot be watched in the background)")
+			n.log.Warn("this compositor hands the clipboard only to the focused window, " +
+				"so henri cannot watch it in the background without making the screen flicker. " +
+				"Copies will not sync until you press a key: run `henri hotkey install`, " +
+				"or set clipboard_poll_only in the config to poll anyway")
+			<-ctx.Done()
+			return
 		} else {
 			n.setWatchMode("polling every " + polling.String())
 			n.log.Debug("no clipboard event source; polling", "every", polling)

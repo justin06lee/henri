@@ -110,17 +110,33 @@ func TestDistinctPhrasesEachTime(t *testing.T) {
 	}
 }
 
-// The checksum is what turns a typo into a clear error instead of a device
-// that quietly never syncs.
+// The checksum turns a typo into a clear error instead of a device that
+// quietly never syncs. It cannot catch everything: it is one bit per 32 bits of
+// entropy, so four bits for a twelve-word phrase, and a corruption still has
+// roughly a one in sixteen chance of checksumming by accident. What it must do
+// is catch the overwhelming majority, which is what this measures.
 func TestChecksumCatchesASwappedWord(t *testing.T) {
-	phrase, _, err := New(128)
-	if err != nil {
-		t.Fatal(err)
+	const trials = 400
+	swaps, caught := 0, 0
+	for i := 0; i < trials; i++ {
+		phrase, _, err := New(128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := Split(phrase)
+		if w[0] == w[1] {
+			continue // swapping a word with itself changes nothing
+		}
+		w[0], w[1] = w[1], w[0]
+		swaps++
+		if _, err := Decode(strings.Join(w, " ")); err != nil {
+			caught++
+		}
 	}
-	w := Split(phrase)
-	w[0], w[1] = w[1], w[0]
-	if _, err := Decode(strings.Join(w, " ")); err == nil {
-		t.Fatal("swapping two words was accepted")
+	// Expected is 15/16, about 94%. Anything below three quarters means the
+	// checksum is not being verified properly rather than merely unlucky.
+	if min := swaps * 3 / 4; caught < min {
+		t.Fatalf("caught %d of %d swapped phrases, want at least %d", caught, swaps, min)
 	}
 }
 
