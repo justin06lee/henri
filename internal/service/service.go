@@ -7,6 +7,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -15,9 +16,11 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
-// Label identifies henri to the service manager.
+// Label identifies henri to the service manager. Both managers build their own
+// name from it: launchd wants reverse DNS, systemd wants a unit filename.
 const Label = "henri"
 
 // ErrUnsupported means this platform has no integration yet.
@@ -30,8 +33,12 @@ type Status struct {
 	Enabled   bool   // it will come back at login
 	Running   bool   // it is running right now
 	UnitPath  string
-	LogHint   string // how to read the logs
-	Detail    string // whatever the service manager said
+	LogHint   string // how to read the logs, as a person would type it
+	// LogCmd is the same thing as an argv, for callers that want to run it.
+	// LogHint cannot be split on spaces to get here: a home directory with a
+	// space in it turns one path into two arguments.
+	LogCmd []string
+	Detail string // whatever the service manager said
 }
 
 // Manager installs and controls the background service.
@@ -113,13 +120,24 @@ func sortedKeys(m map[string]string) []string {
 	return keys
 }
 
+// commandTimeout bounds one service-manager call. Both systemctl --user and
+// launchctl talk over a socket or a bus, and a wedged one would otherwise hang
+// `henri status` forever with nothing on screen -- worse than any error.
+const commandTimeout = 10 * time.Second
+
 // run executes a command and folds its output into any error, since service
 // managers put the useful part on stderr.
 func run(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
 	text := strings.TrimSpace(string(out))
 	if err != nil {
+		if ctx.Err() != nil {
+			return text, fmt.Errorf("%s %s: timed out after %s", name, strings.Join(args, " "), commandTimeout)
+		}
 		if text != "" {
 			return text, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, text)
 		}
@@ -128,12 +146,53 @@ func run(name string, args ...string) (string, error) {
 	return text, nil
 }
 
+// checkUnitValue rejects the characters that no unit format can carry.
+//
+// A newline is the dangerous one: both formats are line- or tag-oriented, so a
+// value containing one stops being a value and starts being another directive.
+// Where the environment is not entirely the user's own -- SSH AcceptEnv, sudo
+// -E, a wrapper script -- that is arbitrary content in the unit file.
+func checkUnitValue(what, v string) error {
+	if i := strings.IndexAny(v, "\n\r\x00"); i >= 0 {
+		return fmt.Errorf("service: %s contains a control character (byte %d at offset %d); refusing to write it into a unit file", what, v[i], i)
+	}
+	return nil
+}
+
 // writeUnit writes a unit file, creating its directory.
 func writeUnit(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	// Never write through a symlink. Where XDG_CONFIG_HOME points at somewhere
+	// shared, a link planted at this path turns `henri service install` into an
+	// overwrite of whatever it names.
+	fi, err := os.Lstat(path)
+	switch {
+	case err == nil && fi.Mode()&os.ModeSymlink != 0:
+		return fmt.Errorf("service: %s is a symlink; refusing to write through it", path)
+	case err != nil && !os.IsNotExist(err):
+		return err
+	}
+
+	// 0600, not 0644. The unit records DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR and
+	// the config path, and every other local user could read them. The explicit
+	// Chmod is for the file that is already there: OpenFile's mode applies only
+	// when it creates one, so an install over a unit written by an older henri
+	// would otherwise keep the old permissions.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // VolatileLocation reports why path is a poor thing to point a login service
