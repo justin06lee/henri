@@ -188,6 +188,8 @@ Lost the phrase? `henri code` prints it again on any device still in the group.
 | `henri service restart` | Restart it after a config change |
 | `henri service uninstall` | Stop it and remove the unit |
 | `henri status` | Show what the local daemon is doing |
+| `henri doctor` | Check everything sync needs and say what is wrong |
+| `henri doctor -fix` | The same, and offer to open the firewall ports |
 | `henri peers` | List known devices |
 | `henri peers add <host:port>` | Add a device that discovery can't reach |
 | `henri peers rm <host:port>` | Remove one |
@@ -411,17 +413,86 @@ and they sync. Two things are worth knowing:
 - **Linux needs a clipboard helper** (`wl-clipboard`, `xclip` or `xsel`), and it
   has to run inside your graphical session. A daemon started from a bare SSH
   shell has no clipboard to watch; `henri status` will show `clipboard  none`.
-- **Open the port.** Many Linux distributions ship a firewall that drops inbound
-  connections. Allow TCP 47600 and UDP 47601 from your LAN:
-
-  ```sh
-  sudo ufw allow from 192.168.1.0/24 to any port 47600 proto tcp
-  sudo ufw allow from 192.168.1.0/24 to any port 47601 proto udp
-  ```
+- **Open the ports.** Most Linux distributions ship a firewall that refuses
+  inbound connections. Run `henri doctor -fix` and it will do this for you.
 
 If discovery does not find the other machine, `henri peers add <ip>:47600` on
 both sides skips it entirely and tells you quickly whether the problem is
 multicast or the firewall.
+
+### One-directional sync is always a firewall
+
+This is worth its own heading because of how badly it disguises itself.
+
+A firewall filters **inbound** traffic only. A device with a closed port still
+announces itself perfectly well and still pushes its own clipboard out — so
+both machines list each other in `henri peers`, everything looks connected, and
+copies travel in exactly one direction. It reads like a bug in henri. It is a
+closed port on whichever machine is *not receiving*.
+
+```sh
+henri doctor
+```
+
+tells you which machine that is, because it opens a real connection to every
+peer and says what came back:
+
+```console
+$ henri doctor
+  ✓ clipboard  pbpaste, readable
+  ✓ daemon     running, pid 6613, up 11m1s
+  ✓ listening  :47600
+  ✓ discovery  on · 66 beacons · last 7s ago
+  ✓ firewall   macOS application firewall is active and henri's ports are open
+
+  ✗ tenet            192.168.1.253:47600
+    refused — the host answered but turned the connection away, which is a
+    firewall rejecting it or henri not running there
+
+what to do
+
+  1. henri on tenet cannot be reached. That is a firewall on THAT machine,
+     not this one — open tcp/47600 and udp/47601 there. `henri doctor -fix` on
+     that device will do it.
+```
+
+The distinction it draws is the one that matters. **Refused** means the packet
+arrived and was turned away — the host is up, and either a firewall is
+rejecting or henri is not running there. **No answer** means the packet vanished,
+which is a firewall dropping it or a network that will not carry traffic between
+the two devices at all.
+
+Then, on the machine that cannot be reached:
+
+```sh
+henri doctor -fix
+```
+
+henri finds the firewall — firewalld, ufw, nftables, iptables — and offers the
+exact commands to open TCP 47600 and UDP 47601, scoped to your local network
+rather than to everything. It asks before running anything, and it never edits a
+hand-written nftables or iptables ruleset: putting a rule in the wrong chain, or
+after a catch-all drop, is worse than printing it and letting you place it.
+
+By hand, if you would rather:
+
+```sh
+# firewalld — Fedora, and common on Arch
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.1.0/24" port port="47600" protocol="tcp" accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.1.0/24" port port="47601" protocol="udp" accept'
+sudo firewall-cmd --reload
+
+# ufw — Debian, Ubuntu
+sudo ufw allow from 192.168.1.0/24 to any port 47600 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 47601 proto udp
+```
+
+Open **both**. Opening only TCP is a trap: the clipboard would transfer if
+discovery ever worked, and discovery is the UDP port, so it never will.
+
+On macOS there is nothing to open — the firewall there filters by application
+and prompts the first time henri listens. If you turned on "Block all incoming
+connections", henri cannot receive anything; `henri doctor` says so.
 
 ---
 
