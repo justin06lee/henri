@@ -8,7 +8,9 @@
 // silently never syncs.
 //
 // The word list is chosen so that the first four letters identify a word
-// uniquely, so `Decode` accepts any prefix of four or more characters.
+// uniquely, so `Decode` accepts any abbreviation of four letters or more. Every
+// word in it is ASCII, so "four letters" and "four bytes" are the same thing
+// here; the code counts bytes.
 package mnemonic
 
 import (
@@ -17,7 +19,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"unicode"
 )
@@ -25,10 +26,17 @@ import (
 //go:embed english.txt
 var wordlistRaw string
 
+// prefixLen is how much of a word has to be typed for henri to recognise it.
+// The BIP-39 English list is built so that four bytes are always enough.
+const prefixLen = 4
+
 var (
-	words   []string
-	byWord  map[string]int
-	sorted_ []string
+	words []string
+	// byWord finds a word typed in full, byPrefix one typed as an
+	// abbreviation. Both are built once, because resolving an abbreviation by
+	// scanning all 2048 words is a scan per word of every phrase henri reads.
+	byWord   map[string]int
+	byPrefix map[string]int
 )
 
 func init() {
@@ -37,11 +45,26 @@ func init() {
 		panic(fmt.Sprintf("mnemonic: word list has %d entries, want 2048", len(words)))
 	}
 	byWord = make(map[string]int, len(words))
+	byPrefix = make(map[string]int, len(words))
 	for i, w := range words {
 		byWord[w] = i
+		if len(w) < prefixLen {
+			// Nothing to abbreviate: a word this short has to be typed whole,
+			// and byWord already finds it.
+			continue
+		}
+		p := w[:prefixLen]
+		// The uniqueness of four-byte prefixes is a property of this
+		// particular word list, and everything about abbreviations rests on
+		// it. Check it here, once, so that swapping the list in for another
+		// one fails loudly at startup rather than quietly resolving a typed
+		// abbreviation to whichever word happened to come first.
+		if j, clash := byPrefix[p]; clash {
+			panic(fmt.Sprintf("mnemonic: %q and %q share their first %d bytes, "+
+				"so abbreviations are ambiguous", words[j], w, prefixLen))
+		}
+		byPrefix[p] = i
 	}
-	sorted_ = append([]string(nil), words...)
-	sort.Strings(sorted_)
 }
 
 // WordCounts are the phrase lengths henri accepts, shortest first.
@@ -164,18 +187,11 @@ func lookup(w string) (int, error) {
 	if i, ok := byWord[w]; ok {
 		return i, nil
 	}
-	if len(w) >= 4 {
-		var hit, n = -1, 0
-		for i, full := range words {
-			if strings.HasPrefix(full, w) {
-				hit, n = i, n+1
-				if n > 1 {
-					break
-				}
-			}
-		}
-		if n == 1 {
-			return hit, nil
+	if len(w) >= prefixLen {
+		// One lookup settles it: the first four bytes name at most one word, so
+		// anything longer only has to agree with the word they name.
+		if i, ok := byPrefix[w[:prefixLen]]; ok && strings.HasPrefix(words[i], w) {
+			return i, nil
 		}
 	}
 	if s := suggest(w); s != "" {
@@ -233,18 +249,14 @@ func abs(n int) int {
 	return n
 }
 
-// Split normalises a typed phrase into its words.
+// Split normalises a typed phrase into its words. Anything that is not a letter
+// separates one word from the next, so punctuation and stray whitespace are
+// simply gaps. FieldsFunc never returns an empty field, so there is nothing to
+// filter out afterwards.
 func Split(phrase string) []string {
-	fields := strings.FieldsFunc(strings.ToLower(phrase), func(r rune) bool {
+	return strings.FieldsFunc(strings.ToLower(phrase), func(r rune) bool {
 		return !unicode.IsLetter(r)
 	})
-	out := fields[:0]
-	for _, f := range fields {
-		if f != "" {
-			out = append(out, f)
-		}
-	}
-	return out
 }
 
 func joinCounts() string {
