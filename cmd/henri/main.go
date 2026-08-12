@@ -776,7 +776,35 @@ func cmdDoctor(args []string) error {
 	}
 
 	if st != nil {
-		fmt.Printf("  ✓ listening  :%d\n", st.ListenPort)
+		// Not "the config says this port": actually open a connection to this
+		// machine's own address on the network, the way a peer would. The
+		// daemon answering on loopback proves almost nothing -- a listener can
+		// be up and still refuse every connection that arrives over IPv4, which
+		// is what net.ipv6.bindv6only=1 does to Go's dual-stack ":port" bind.
+		// A device in that state looks perfectly healthy from the inside and is
+		// unreachable from every other device in the group.
+		self := firewall.LocalAddress()
+		switch {
+		case self == "":
+			fmt.Printf("  – listening  :%d (no local network address to test against)\n", st.ListenPort)
+		default:
+			selfAddr := net.JoinHostPort(self, strconv.Itoa(st.ListenPort))
+			if ok, reason := firewall.Reach(selfAddr, reachTimeout); ok {
+				fmt.Printf("  ✓ listening  %s, accepting connections\n", selfAddr)
+			} else {
+				fmt.Printf("  ✗ listening  %s is not accepting connections\n", selfAddr)
+				fmt.Printf("               %s\n", reason)
+				problems = append(problems, fmt.Sprintf(
+					"This device is unreachable at its own address, %s, so no peer can\n"+
+						"     reach it either. The daemon is running and answers on loopback, so\n"+
+						"     this is not henri being down — something is refusing the connection\n"+
+						"     before it arrives. On Linux the usual cause is a dual-stack bind that\n"+
+						"     will not take IPv4:\n\n"+
+						"         sysctl net.ipv6.bindv6only     # 1 is the problem, 0 is correct\n"+
+						"         sudo sysctl -w net.ipv6.bindv6only=0\n\n"+
+						"     Otherwise it is a local firewall rule; check `sudo nft list ruleset`.", selfAddr))
+			}
+		}
 		if st.Discovery {
 			mark := "✓"
 			if st.LastBeaconAt == 0 || time.Since(time.UnixMilli(st.LastBeaconAt)) > deafFor {
@@ -817,9 +845,11 @@ func cmdDoctor(args []string) error {
 			fmt.Printf("  no peers known yet\n")
 		}
 		for _, p := range st.Peers {
+			// A peer added by address has no name until it answers, and
+			// printing the address in both columns just looks broken.
 			name := safe(p.Name, maxName)
 			if name == "" {
-				name = safe(p.Addr, maxAddr)
+				name = "—"
 			}
 			ok, reason := firewall.Reach(p.Addr, reachTimeout)
 			if ok {

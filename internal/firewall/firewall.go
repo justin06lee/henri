@@ -85,19 +85,30 @@ func (s Status) Blocking() bool {
 func Detect(tcpPort, udpPort int, lan string) Status {
 	switch runtime.GOOS {
 	case "linux", "freebsd":
-		if st, ok := detectFirewalld(tcpPort, udpPort, lan); ok {
-			return st
+		// Keep looking past a backend that is installed but switched off.
+		// firewalld ships on distributions that then leave it masked and filter
+		// with nftables directly, and stopping at the first name found reports
+		// "firewalld is not active" as though that settled the question -- while
+		// an active nftables ruleset goes unmentioned.
+		var inactive Status
+		for _, probe := range []func() (Status, bool){
+			func() (Status, bool) { return detectFirewalld(tcpPort, udpPort, lan) },
+			func() (Status, bool) { return detectUFW(tcpPort, udpPort, lan) },
+			func() (Status, bool) { return detectNftables(tcpPort, udpPort) },
+			func() (Status, bool) { return detectIptables(tcpPort, udpPort) },
+		} {
+			st, found := probe()
+			if !found {
+				continue
+			}
+			if st.Active {
+				return st
+			}
+			if inactive.Name == "" {
+				inactive = st
+			}
 		}
-		if st, ok := detectUFW(tcpPort, udpPort, lan); ok {
-			return st
-		}
-		if st, ok := detectNftables(tcpPort, udpPort); ok {
-			return st
-		}
-		if st, ok := detectIptables(tcpPort, udpPort); ok {
-			return st
-		}
-		return Status{}
+		return inactive
 	case "darwin":
 		return detectMacOS()
 	default:
@@ -341,6 +352,33 @@ func LocalNetwork() string {
 				continue
 			}
 			return (&net.IPNet{IP: ipnet.IP.Mask(ipnet.Mask), Mask: ipnet.Mask}).String()
+		}
+	}
+	return ""
+}
+
+// LocalAddress returns this machine's own address on the local network, so a
+// check can ask whether henri is reachable the way a peer would reach it rather
+// than only over loopback. Returns "" when there is no obvious answer.
+func LocalAddress() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, ifi := range ifaces {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil || !ipnet.IP.IsPrivate() {
+				continue
+			}
+			return ipnet.IP.String()
 		}
 	}
 	return ""
