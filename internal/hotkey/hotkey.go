@@ -8,12 +8,16 @@
 package hotkey
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
 // DefaultAccel is the shortcut henri binds, in GNOME's accelerator syntax.
@@ -32,7 +36,13 @@ const (
 
 // pathPattern pulls the entries out of a gsettings string-array literal.
 // dconf paths contain no quotes, so this needs no escaping care.
-var pathPattern = regexp.MustCompile(`'([^']*)'`)
+//
+// It is anchored to /org/gnome/ deliberately. Every custom keybinding lives
+// under that prefix, and matching any quoted run at all swallowed dconf's own
+// startup warning -- `dconf-WARNING **: unable to open file
+// '/etc/dconf/db/local'` is exactly the same shape -- which then got written
+// straight back into the user's real custom-keybindings list.
+var pathPattern = regexp.MustCompile(`'(/org/gnome/[^']*)'`)
 
 // Status describes the current binding.
 type Status struct {
@@ -61,6 +71,12 @@ func Install(command, accel string) error {
 	if !gnomeAvailable() {
 		return ErrManual
 	}
+	if err := checkArg("shortcut", accel); err != nil {
+		return err
+	}
+	if err := checkArg("command", command); err != nil {
+		return err
+	}
 	list, err := customList()
 	if err != nil {
 		return err
@@ -85,12 +101,21 @@ func Install(command, accel string) error {
 
 // Uninstall removes henri's binding, leaving any others alone.
 func Uninstall() error {
+	_, err := UninstallReport()
+	return err
+}
+
+// UninstallReport removes henri's binding and says whether there was one.
+//
+// Uninstall cannot: it returns nil both when it removed a binding and when it
+// found none, so the CLI thanks people for removing a shortcut they never had.
+func UninstallReport() (removed bool, err error) {
 	if !gnomeAvailable() {
-		return ErrManual
+		return false, ErrManual
 	}
 	list, err := customList()
 	if err != nil {
-		return err
+		return false, err
 	}
 	kept := make([]string, 0, len(list))
 	for _, p := range list {
@@ -99,16 +124,16 @@ func Uninstall() error {
 		}
 	}
 	if len(kept) == len(list) {
-		return nil
+		return false, nil
 	}
 	if err := setCustomList(kept); err != nil {
-		return err
+		return false, err
 	}
 	// Reset the keys too, so a reinstall does not inherit stale values.
 	for _, k := range []string{"name", "command", "binding"} {
 		_, _ = run("gsettings", "reset", gnomeSub, k)
 	}
-	return nil
+	return true, nil
 }
 
 // Get reports the current binding.
@@ -145,8 +170,11 @@ func Instructions(command, accel string) string {
 
 // Human renders an accelerator the way a person would write it.
 func Human(accel string) string {
+	// <Primary> is GNOME's canonical spelling for Ctrl, and it is what its own
+	// Settings UI writes into the binding key, so leaving it out meant `henri
+	// hotkey status` printing raw markup at anyone who set the shortcut there.
 	r := strings.NewReplacer("<Super>", "Super+", "<Shift>", "Shift+",
-		"<Control>", "Ctrl+", "<Ctrl>", "Ctrl+", "<Alt>", "Alt+")
+		"<Primary>", "Ctrl+", "<Control>", "Ctrl+", "<Ctrl>", "Ctrl+", "<Alt>", "Alt+")
 	out := r.Replace(accel)
 	if i := strings.LastIndex(out, "+"); i >= 0 && i+1 < len(out) {
 		out = out[:i+1] + strings.ToUpper(out[i+1:])
@@ -154,16 +182,37 @@ func Human(accel string) string {
 	return out
 }
 
+var (
+	gnomeOnce sync.Once
+	gnomeOK   bool
+)
+
+// gnomeAvailable reports whether GNOME's settings daemon is here to be asked.
+//
+// Answered once: the schema cannot appear or vanish while henri runs, and
+// listing every schema on the system costs a subprocess and several hundred
+// lines of output -- which `henri hotkey status` was paying for twice to
+// answer one question.
 func gnomeAvailable() bool {
-	if _, err := exec.LookPath("gsettings"); err != nil {
-		return false
-	}
-	// The schema is only present where GNOME's settings daemon is installed.
-	out, err := run("gsettings", "list-schemas")
-	if err != nil {
-		return false
-	}
-	return strings.Contains(out, gnomeSchema)
+	gnomeOnce.Do(func() {
+		if _, err := exec.LookPath("gsettings"); err != nil {
+			return
+		}
+		// The schema is only present where GNOME's settings daemon is installed.
+		out, err := run("gsettings", "list-schemas")
+		if err != nil {
+			return
+		}
+		// A whole line, not a substring: another schema that merely starts with
+		// this name would otherwise answer for it.
+		for _, line := range strings.Split(out, "\n") {
+			if strings.TrimSpace(line) == gnomeSchema {
+				gnomeOK = true
+				return
+			}
+		}
+	})
+	return gnomeOK
 }
 
 func customList() ([]string, error) {
@@ -183,7 +232,10 @@ func customList() ([]string, error) {
 func setCustomList(list []string) error {
 	quoted := make([]string, len(list))
 	for i, p := range list {
-		quoted[i] = "'" + p + "'"
+		// Paths that came back from dconf hold no quotes or backslashes, but
+		// this literal is handed to a parser, so escape rather than trust.
+		esc := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(p)
+		quoted[i] = "'" + esc + "'"
 	}
 	value := "[" + strings.Join(quoted, ", ") + "]"
 	_, err := run("gsettings", "set", gnomeSchema, "custom-keybindings", value)
@@ -195,7 +247,39 @@ func getString(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.Trim(strings.TrimSpace(out), "'"), nil
+	return unquote(out), nil
+}
+
+// unquote turns the GVariant string literal gsettings prints back into its
+// value: one quote off each end, not every quote there is, and the escapes the
+// literal introduced undone.
+func unquote(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") {
+		s = s[1 : len(s)-1]
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && (s[i+1] == '\'' || s[i+1] == '\\') {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// checkArg refuses a value that would be read as an option rather than as
+// itself. gsettings takes its arguments by position, so this is belt and
+// braces -- but a shortcut or command starting with a dash is a mistake in any
+// case, and silently binding one is worse than saying so.
+func checkArg(what, v string) error {
+	if v == "" {
+		return fmt.Errorf("hotkey: the %s is empty", what)
+	}
+	if strings.HasPrefix(v, "-") {
+		return fmt.Errorf("hotkey: the %s %q starts with a dash, which would be read as an option", what, v)
+	}
+	return nil
 }
 
 func contains(list []string, want string) bool {
@@ -207,11 +291,37 @@ func contains(list []string, want string) bool {
 	return false
 }
 
+// commandTimeout bounds one gsettings call. gsettings talks to dconf over
+// D-Bus, and a wedged bus would otherwise hang `henri hotkey status` forever
+// with nothing on screen.
+const commandTimeout = 10 * time.Second
+
+// run executes a command and returns its stdout only.
+//
+// The separation matters. dconf greets many sessions with `dconf-WARNING **:
+// unable to open file '/etc/dconf/db/local'` on stderr, and folding that into
+// the output meant the keybinding parser read the path out of the warning and
+// wrote it into the user's real shortcut list. stderr belongs in the error, and
+// nowhere else.
 func run(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).CombinedOutput()
-	text := strings.TrimSpace(string(out))
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	text := strings.TrimSpace(stdout.String())
 	if err != nil {
-		return text, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, text)
+		if ctx.Err() != nil {
+			return text, fmt.Errorf("%s %s: timed out after %s", name, strings.Join(args, " "), commandTimeout)
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return text, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, msg)
+		}
+		return text, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return text, nil
 }

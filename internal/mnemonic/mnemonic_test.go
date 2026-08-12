@@ -247,3 +247,74 @@ func TestSuggestionHandlesTransposedLetters(t *testing.T) {
 		}
 	}
 }
+
+// Abbreviations used to be resolved by scanning all 2048 words on every lookup.
+// They come out of a map built at startup now, so this checks the map agrees
+// with the list it was built from -- for every word, not a sample.
+func TestEveryWordResolvesFromItsAbbreviation(t *testing.T) {
+	for i, w := range words {
+		if got, err := lookup(w); err != nil || got != i {
+			t.Fatalf("lookup(%q) = %d, %v; want %d", w, got, err, i)
+		}
+		if len(w) < prefixLen {
+			continue
+		}
+		if got, err := lookup(w[:prefixLen]); err != nil || got != i {
+			t.Fatalf("lookup(%q) = %d, %v; want %d (%q)", w[:prefixLen], got, err, i, w)
+		}
+		// Anything between the abbreviation and the whole word works too.
+		for n := prefixLen; n <= len(w); n++ {
+			if got, err := lookup(w[:n]); err != nil || got != i {
+				t.Fatalf("lookup(%q) = %d, %v; want %d (%q)", w[:n], got, err, i, w)
+			}
+		}
+	}
+}
+
+func TestAbbreviationsThatNameNoWordAreRejected(t *testing.T) {
+	for _, typed := range []string{
+		"zzzz",      // no word begins with it
+		"abandonx",  // a real word with something stuck on the end
+		"abandonxy", // and further from it still
+		"socialise", // a real word that is a prefix of nothing
+	} {
+		if i, err := lookup(typed); err == nil {
+			t.Errorf("lookup(%q) accepted it as %q", typed, words[i])
+		}
+	}
+}
+
+// byPrefix has to cover every word long enough to abbreviate, and only those.
+func TestPrefixIndexCoversTheWordList(t *testing.T) {
+	want := 0
+	for _, w := range words {
+		if len(w) >= prefixLen {
+			want++
+		}
+	}
+	if len(byPrefix) != want {
+		t.Fatalf("byPrefix has %d entries, want %d", len(byPrefix), want)
+	}
+	for p, i := range byPrefix {
+		if !strings.HasPrefix(words[i], p) {
+			t.Fatalf("byPrefix[%q] points at %q", p, words[i])
+		}
+	}
+}
+
+// Split gets its words from FieldsFunc, which never returns an empty field.
+func TestSplitDropsEverythingThatIsNotALetter(t *testing.T) {
+	got := Split("  1. Legal --- winner,, \t thank\n")
+	want := []string{"legal", "winner", "thank"}
+	if len(got) != len(want) {
+		t.Fatalf("Split gave %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Split gave %q, want %q", got, want)
+		}
+	}
+	if len(Split("")) != 0 || len(Split("12345")) != 0 {
+		t.Fatal("Split found words in a string with no letters in it")
+	}
+}

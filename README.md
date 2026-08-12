@@ -109,37 +109,46 @@ Your recovery phrase — these 15 words are the whole secret:
     9. wage        10. eternal     11. bean        12. smile
    13. real        14. release     15. couple
 
-On every other device, run:
-
-  henri join glue report social awake strike piano arm awesome wage eternal bean smile real release couple
+On every other device, run `henri join` and type those words in when
+it asks for them.
 ```
 
 Type those words on every other device:
 
 ```console
-$ henri join glue report social awake strike piano arm awesome wage eternal bean smile real release couple
+$ henri join
+Recovery phrase (the words `henri init` printed): glue report social awake …
 Joined group JS8lEL6zZyc as "desktop".
 ```
+
+`henri join <words>` still works and is still in a lot of muscle memory, but it
+is the worse way to move a group key: a command line is readable by every other
+user on the machine through `ps auxww`, and your shell writes it into its
+history file. With nothing after `join`, henri asks — and if stdin is not a
+terminal it reads the phrase from there, so `henri join < phrase.txt` works too.
 
 You do not have to be precise about it. Case, punctuation and stray whitespace
 are all ignored, and because no two words in the list share their first four
 letters you can abbreviate every one of them:
 
-```sh
-henri join glue repo soci awak stri pian arm awes wage eter bean smil real rele coup
+```console
+$ henri join
+Recovery phrase (the words `henri init` printed): glue repo soci awak stri pian arm awes wage eter bean smil real rele coup
 ```
 
 Get a word wrong and henri says so, instead of quietly building the wrong key:
 
 ```console
-$ henri join glue report socail awake strike ...
+$ henri join
+Recovery phrase (the words `henri init` printed): glue report socail awake strike …
 henri: mnemonic: word 3: "socail" is not one of the words — did you mean "social"?
 ```
 
 Get the *order* wrong and the checksum catches that too:
 
 ```console
-$ henri join report glue social awake strike ...
+$ henri join
+Recovery phrase (the words `henri init` printed): report glue social awake strike …
 henri: mnemonic: that phrase does not check out — every word is real, so one of
 them is probably in the wrong place or slightly wrong
 ```
@@ -169,7 +178,8 @@ Lost the phrase? `henri code` prints it again on any device still in the group.
 | Command | What it does |
 | --- | --- |
 | `henri init` | Start a new clipboard group on this device |
-| `henri join <words>` | Join an existing group using its recovery phrase |
+| `henri join` | Join an existing group; asks for the recovery phrase |
+| `henri join <words>` | The same, with the phrase on the command line — see the warning above |
 | `henri code` | Print this group's recovery phrase again |
 | `henri daemon` | Run the sync daemon in the foreground |
 | `henri service install` | Run henri in the background, starting at login |
@@ -183,7 +193,7 @@ Lost the phrase? `henri code` prints it again on any device still in the group.
 | `henri peers rm <host:port>` | Remove one |
 | `henri send` | Send the current clipboard to the group |
 | `henri send -highlighted` | Copy the highlighted text here *and* send it |
-| `henri hotkey install` | Bind a key to `henri send`, for desktops henri cannot watch |
+| `henri hotkey install` | Bind a key to `henri send -highlighted`, for desktops henri cannot watch |
 | `henri hotkey status` | Show the current binding |
 | `henri hotkey uninstall` | Remove it |
 | `henri leave` | Remove this device's config and leave the group |
@@ -198,7 +208,8 @@ henri  ● running
   device     laptop  (dQw4w9WgXcQ)
   group      BY_l6z_OVEA
   clipboard  pbpaste
-  listening  :47600   discovery on
+  listening  :47600
+  discovery  on · 412 beacons · last 4s ago
   uptime     4h12m   pid 5512
   traffic    38 sent · 51 received
   last       1.2 KiB from desktop, 6s ago
@@ -206,8 +217,35 @@ henri  ● running
 peers
   ● desktop            192.168.1.42:47600     discovered  3s ago
   ● phone              192.168.1.77:47600     discovered  9s ago
-  ○ 10.8.0.4:47600     10.8.0.4:47600         config      never
+  ○ —                  10.8.0.4:47600         config      never
 ```
+
+The `discovery` line is the one to read when the peer list is emptier than it
+should be. "on" on its own used to be all it said, which a daemon whose
+multicast membership had been dropped went on reporting perfectly cheerfully
+while hearing nothing at all. Now it counts, and complains:
+
+```console
+$ henri status
+  discovery  on · 12 beacons · last 17m4s ago
+  …
+
+⚠  Discovery is on, but nothing has been heard for 17m4s.
+
+   Devices announce themselves every 10 seconds, so either nothing else in
+   this group is running, or this device has stopped hearing them: a Wi-Fi
+   roam, a suspend or a VPN coming up drops the multicast membership without
+   telling the socket. henri takes it out again about once a minute.
+
+   If another device is definitely running, check `henri status` there, and
+   that UDP 47601 is allowed on both. To stop depending on multicast:
+
+       henri peers add <host:port>
+```
+
+`henri status` exits non-zero when the daemon is not running, so
+`until henri status; do sleep 1; done` is a wait loop that terminates. It still
+prints its friendly stopped page on stdout; only the exit status differs.
 
 ---
 
@@ -235,7 +273,9 @@ peers
    open · verify · write to the local clipboard
 
   discovery: every 10s each device multicasts an encrypted
-  "hello" to 239.42.47.60:47601 so the others learn its address
+  "hello" to 239.42.47.60:47601 so the others learn its address,
+  and re-takes its multicast membership about once a minute so a
+  network that moves underneath it does not leave it deaf
 ```
 
 A few details that matter:
@@ -250,6 +290,15 @@ Where neither is available it falls back to checking every 400ms, which works
 everywhere but has a cost: each check spawns a helper process, and on Wayland
 reading a selection can require briefly taking keyboard focus. Two and a half
 times a second, that is a visible flicker.
+
+**Discovery re-joins the network it is on.** A multicast membership belongs to
+an interface, and the kernel drops it when that interface goes — a Wi-Fi roam, a
+suspend, a DHCP renew, a VPN coming up. Nothing tells the socket, so a daemon
+that was listening happily an hour ago sits there stone deaf while it carries on
+announcing itself. henri throws the membership away and takes it out again about
+once a minute, and sooner when it has heard nothing for 40 seconds. `henri
+status` shows how many beacons it has heard and how long ago, and says so
+plainly when the answer is "not for a while".
 
 **No echo storms.** Each device remembers the SHA-256 of the clipboard content
 it currently considers in sync. A device claims that fingerprint *before* it
@@ -273,9 +322,17 @@ mixed in as additional authenticated data.
 what proves a device is in the group; anything that fails to authenticate is
 dropped without a reply.
 
-**Replays are refused.** Every message carries a timestamp and is rejected if
-it's more than two minutes off. Payloads also carry a hash of their contents,
-and a mismatch is refused.
+**Every frame is delivered once.** Each message carries a timestamp and is
+refused if it is more than two minutes away from this device's clock. On its own
+that left a two-minute window in which a frame captured off the wire was as good
+as the original — long enough to put an old clipboard back under you at the
+moment you paste, or to re-home a peer with a replayed beacon. So henri also
+remembers the random nonce of every frame it has acted on for the length of that
+window, and refuses the same frame a second time.
+
+Payloads carry a hash of their contents too, but that is a consistency check and
+not a defence: it travels *inside* the sealed envelope, so anyone able to change
+it could change the payload it describes. It catches a bug, not an attacker.
 
 ---
 
@@ -284,6 +341,19 @@ and a mismatch is refused.
 `~/.config/henri/config.json` (override with `$HENRI_CONFIG` or
 `$XDG_CONFIG_HOME`; `%APPDATA%\henri\` on Windows). It is written `0600` and
 `henri` refuses to start if anyone else can read it — it holds your group key.
+
+That permission check is a Unix one, and henri skips it on Windows, where the
+mode bits Go reports say nothing about who can open the file. On Windows keep
+`%APPDATA%\henri\` somewhere only your account can read.
+
+`group_id` and `key` are both derived from `phrase`, and henri checks that they
+still are every time it reads the file. Editing one of them without the other —
+or swapping in somebody else's — is refused rather than quietly obeyed, because
+a config that syncs to a group other than the one its words name is exactly what
+that would look like from the outside.
+
+If `~/.config` is a symlink into a dotfiles directory, saving follows it: henri
+writes the file the link points at and leaves the link alone.
 
 ```json
 {
@@ -321,7 +391,13 @@ router — won't be found by multicast. Add them by address:
 
 ```sh
 henri peers add 10.8.0.4:47600
+henri peers add 10.8.0.4                # :47600 is assumed
+henri peers add [fd00::4]:47600         # IPv6 goes in brackets, as ever
 ```
+
+An address that is not one — a port that is not a number, or not a port — is
+refused when you add it rather than accepted and then silently never dialled.
+Discovery itself is IPv4 multicast; peers listed by address can be either.
 
 Over the open internet, put henri inside a WireGuard or Tailscale network rather
 than forwarding port 47600. The payloads are encrypted either way, but there's
@@ -385,6 +461,27 @@ henri service uninstall   # stop it and remove the unit
 
 Both run as *your* user inside your graphical session, on purpose: the clipboard
 belongs to that session, so a system-wide daemon could not reach it.
+
+### After upgrading henri, re-run `henri service install`
+
+It is idempotent, and nothing else rewrites the unit file — so an existing
+install keeps whatever was written the first time, bugs included.
+
+- **macOS.** launchd hands a job an environment with no locale at all, and
+  `pbcopy`/`pbpaste` take their text encoding from `LANG`, falling back to plain
+  C when it is unset. Every accented character, curly quote, em dash, CJK
+  character and emoji was mangled in both directions — but only under launchd,
+  so it looked fine everywhere it is easy to test. The plist now sets `LANG`,
+  and brings henri back when it *crashes* rather than on any exit at all, which
+  used to respawn a daemon that could never start, every few seconds, forever.
+- **Linux.** The unit is now wanted by `graphical-session.target` rather than
+  `default.target`, so it starts once there is a display to read rather than
+  before. `PrivateTmp` is gone: X11's local transport is a socket in
+  `/tmp/.X11-unix`, so a private `/tmp` meant `xclip` and `xsel` could never
+  open the display, and where unprivileged user namespaces are off the unit
+  failed outright at `226/NAMESPACE`.
+
+Until you re-run it, an existing install goes on quietly doing the old thing.
 
 ### Two things it checks before installing
 
@@ -468,8 +565,8 @@ henri can set the binding itself on GNOME. Everywhere else it prints the line to
 add to your compositor's config:
 
 ```
-sway / i3      bindsym $mod+Shift+c exec /usr/local/bin/henri send
-hyprland       bind = SUPER SHIFT, C, exec, /usr/local/bin/henri send
+sway / i3      bindsym $mod+Shift+c exec /usr/local/bin/henri send -highlighted
+hyprland       bind = SUPER SHIFT, C, exec, /usr/local/bin/henri send -highlighted
 ```
 
 If you would rather have automatic syncing and can live with the flicker, poll
@@ -560,6 +657,10 @@ without it, and you can rejoin later with the same phrase. henri refuses to do
 it while the daemon is running, because a running daemon already holds the key
 in memory and would keep syncing after the file was gone.
 
+It takes the whole key with it: any half-written temporary copy left by an
+interrupted save goes too, and where the config is a symlink so does the file it
+links to. `henri leave` names both before it asks.
+
 There is no way to evict a device remotely. If one is lost or you want it out
 for good, run `henri init` somewhere to make a new group and re-join the devices
 you still trust; the old phrase then opens nothing that matters.
@@ -571,10 +672,15 @@ you still trust; the old phrase then opens nothing that matters.
 What henri gives you:
 
 - Clipboard contents are encrypted and authenticated with AES-256-GCM. Nothing
-  on your network can read or alter them.
+  on your network can read one, and nothing without the group key can change one
+  in flight: the tag fails and the frame is dropped without a reply.
+- A whole frame captured off the wire cannot be delivered a second time. henri
+  remembers the nonce of every frame it has acted on for as long as that frame
+  would still count as fresh.
 - Only devices holding the group key can send or receive.
-- The config file holding that key is `0600`, and henri refuses to run if it
-  isn't.
+- The config file holding that key is `0600` on Unix, and henri refuses to run
+  if it isn't. It also checks that the group in it is still the group its
+  recovery phrase names.
 
 What it does not give you, and you should know:
 
@@ -605,7 +711,8 @@ on someone else's servers forever.
 
 Phrase lengths are always a multiple of three — 12, 15, 18, 21 or 24. Each word
 carries 11 bits and the checksum is a 32nd of the entropy, so the word count
-works out to `32 x bits / 3` and only those five come out whole. There is no
+works out to `3 x bits / 32` — 128 bits is twelve words — and only those five
+come out whole. There is no
 such thing as a 16-word BIP-39 phrase.
 
 Found a problem? Open an issue.
@@ -623,6 +730,11 @@ Found a problem? Open an issue.
   knowing if you're testing on a single box. Use `peers` for that.
 - **No history.** henri syncs the current clipboard; it isn't a clipboard
   manager.
+- **Discovery is IPv4 only.** Beacons go to an IPv4 multicast group. IPv6
+  devices sync perfectly well once you list them with `henri peers add`, but
+  they will not find each other on their own.
+- **No key rotation.** Changing the group key means `henri init` somewhere and
+  re-joining every device.
 - **`henri service` is macOS and Linux only.** Windows syncs fine, but has no
   install-at-login integration yet; run `henri daemon` from a shortcut in
   `shell:startup` for now.
@@ -641,7 +753,9 @@ make dist    # cross-compile to dist/bin/
 The tests run whole groups of nodes against a fake clipboard, so they never
 touch the real one. They cover propagation between peers, the echo guard,
 foreign-key rejection, replays, oversized payloads, and peer expiry. The
-mnemonic package is checked against the official BIP-39 test vectors.
+mnemonic package is checked against the official BIP-39 test vectors, and the
+CLI's own tests cover argument handling, address parsing and the formatting
+helpers — against a config in a temporary directory, never yours.
 
 ```
 cmd/henri            the CLI

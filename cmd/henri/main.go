@@ -2,13 +2,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -16,8 +19,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"bufio"
+	"unicode"
 
 	"github.com/justin06lee/henri/internal/clipboard"
 	"github.com/justin06lee/henri/internal/config"
@@ -30,12 +32,20 @@ import (
 // version is overridden at build time with -ldflags "-X main.version=...".
 var version = "0.9.0"
 
-// codePrefix tags a join code so a mistyped paste fails early and clearly.
-const codePrefix = "henri1:"
+// errSaidItAlready means the command has already told the user everything there
+// is to say and only the exit status is left to report.
+//
+// `henri status` with the daemon stopped is the display working exactly as
+// intended, and it still has to fail: `until henri status; do sleep 1; done` is
+// how people wait for the daemon to come up, and a loop like that could never
+// finish while a stopped daemon exited 0.
+var errSaidItAlready = errors.New("henri: nothing further to report")
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "henri: "+err.Error())
+		if !errors.Is(err, errSaidItAlready) {
+			fmt.Fprintln(os.Stderr, "henri: "+err.Error())
+		}
 		os.Exit(1)
 	}
 }
@@ -51,20 +61,20 @@ func run(args []string) error {
 	case "join":
 		return cmdJoin(args[1:])
 	case "code":
-		return cmdCode()
-	case "daemon", "run", "start":
+		return cmdCode(args[1:])
+	case "daemon":
 		return cmdDaemon(args[1:])
 	case "status":
-		return cmdStatus()
+		return cmdStatus(args[1:])
 	case "peers":
 		return cmdPeers(args[1:])
-	case "send", "push":
+	case "send":
 		return cmdSend(args[1:])
-	case "leave", "forget":
+	case "leave":
 		return cmdLeave(args[1:])
 	case "service":
 		return cmdService(args[1:])
-	case "hotkey", "key":
+	case "hotkey":
 		return cmdHotkey(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("henri " + version)
@@ -84,11 +94,11 @@ func usage() {
 usage: henri <command> [flags]
 
   init            start a new clipboard group on this device
-  join <words>    join an existing group using its recovery phrase
+  join            join an existing group; asks for the recovery phrase
   code            print this group's recovery phrase
   daemon          run the sync daemon in the foreground
   service         run henri in the background, starting at login
-  hotkey          bind a key to ` + "`henri send`" + `, for desktops henri cannot watch
+  hotkey          bind a key to ` + "`henri send -highlighted`" + `, for desktops henri cannot watch
   status          show what the local daemon is doing
   peers           list known devices; ` + "`peers add|rm <host:port>`" + ` to edit
   send            send the clipboard to the group (-highlighted for the selection)
@@ -99,16 +109,113 @@ Run 'henri <command> -h' for the flags a command accepts.
 `)
 }
 
+// --- flag plumbing ---------------------------------------------------------
+
+// parseFlags parses one command's flags. done means the command has nothing
+// left to do -- the user asked for help and got it.
+//
+// It exists because flag.ContinueOnError makes two things awkward, and every
+// call site used to get both wrong. Asking for help comes back as
+// flag.ErrHelp, an error like any other, so `henri init -h` printed the help
+// and then "henri: flag: help requested" and exited 1; asking for help is not a
+// failure. And the FlagSet prints its own message before returning any error,
+// so handing that error back printed it a second time. Here the FlagSet's own
+// output is silenced, help goes to stdout where a pager can take it, and a real
+// mistake is reported once.
+func parseFlags(fs *flag.FlagSet, args []string, usageLine string) (done bool, err error) {
+	fs.SetOutput(io.Discard)
+	err = fs.Parse(args)
+	switch {
+	case errors.Is(err, flag.ErrHelp):
+		fs.SetOutput(os.Stdout)
+		fmt.Printf("usage: %s\n", usageLine)
+		if hasFlags(fs) {
+			fmt.Println()
+			fs.PrintDefaults()
+		}
+		return true, nil
+	case err != nil:
+		fs.SetOutput(os.Stderr)
+		fmt.Fprintf(os.Stderr, "usage: %s\n", usageLine)
+		if hasFlags(fs) {
+			fmt.Fprintln(os.Stderr)
+			fs.PrintDefaults()
+		}
+		fmt.Fprintln(os.Stderr)
+		return false, err
+	}
+	return false, nil
+}
+
+func hasFlags(fs *flag.FlagSet) bool {
+	any := false
+	fs.VisitAll(func(*flag.Flag) { any = true })
+	return any
+}
+
+// noArgs rejects stray words after a command that takes none.
+//
+// Quietly ignoring them is how `henri service uninstall --nope` removed a real
+// launchd agent and reported only "Removed the launchd service" -- the flag it
+// did not understand was never mentioned, and neither was the fact that it had
+// gone ahead anyway.
+func noArgs(fs *flag.FlagSet) error {
+	if fs.NArg() == 0 {
+		return nil
+	}
+	return fmt.Errorf("`henri %s` takes no arguments, but got %q; "+
+		"run `henri %s -h` for the flags it does take", fs.Name(), fs.Arg(0), fs.Name())
+}
+
+// bareCommand parses a subcommand that takes neither flags nor arguments, so
+// that anything typed after it is reported rather than acted through.
+func bareCommand(name string, args []string) (done bool, err error) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	if done, err := parseFlags(fs, args, "henri "+name); done || err != nil {
+		return done, err
+	}
+	return false, noArgs(fs)
+}
+
+// flagWasGiven reports whether a flag was actually typed, as opposed to sitting
+// at its default value.
+func flagWasGiven(fs *flag.FlagSet, name string) bool {
+	given := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			given = true
+		}
+	})
+	return given
+}
+
+// checkPortFlag rejects a port before anything is done with it. `henri init
+// -port 99999` used to report success and write a config nothing could load;
+// the failure surfaced much later as "listen tcp: address 99999: invalid port",
+// out of commands that had never mentioned a port at all.
+func checkPortFlag(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("-port must be between 1 and 65535, not %d", port)
+	}
+	return nil
+}
+
 // --- init ------------------------------------------------------------------
 
 func cmdInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-	name := fs.String("name", defaultDeviceName(), "name for this device")
+	// The default is resolved after parsing, not here: os.Hostname() at
+	// flag-definition time runs on every `henri init`, including the ones that
+	// pass -name and never look at it.
+	name := fs.String("name", "", "name for this device (default: this machine's hostname)")
 	port := fs.Int("port", config.DefaultListenPort, "TCP port to receive clipboard updates on")
 	discovery := fs.Bool("discovery", true, "find other devices on the LAN automatically")
 	words := fs.Int("words", 15, "length of the recovery phrase (12, 15, 18, 21 or 24)")
 	force := fs.Bool("force", false, "overwrite an existing config")
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseFlags(fs, args, "henri init [flags]"); done || err != nil {
+		return err
+	}
+	if err := noArgs(fs); err != nil {
 		return err
 	}
 	bits, ok := mnemonic.EntropyBitsFor(*words)
@@ -116,6 +223,9 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("-words must be 12, 15, 18, 21 or 24, not %d — a phrase length is "+
 			"always a multiple of three, because each word carries 11 bits and the checksum "+
 			"is a 32nd of the entropy", *words)
+	}
+	if err := checkPortFlag(*port); err != nil {
+		return err
 	}
 
 	path, err := config.Path()
@@ -126,7 +236,7 @@ func cmdInit(args []string) error {
 		return fmt.Errorf("a config already exists at %s (use -force to replace it, which leaves this device's current group)", path)
 	}
 
-	cfg, err := config.New(*name, bits)
+	cfg, err := config.New(deviceName(*name), bits)
 	if err != nil {
 		return err
 	}
@@ -142,10 +252,13 @@ func cmdInit(args []string) error {
 	fmt.Printf("  group    %s\n\n", cfg.GroupID)
 	fmt.Printf("Your recovery phrase — these %d words are the whole secret:\n\n", *words)
 	fmt.Print(formatPhrase(cfg.Phrase))
-	fmt.Printf("\nOn every other device, run:\n\n  henri join %s\n\n", cfg.Phrase)
+	fmt.Printf("\nOn every other device, run `henri join` and type those words in when\n")
+	fmt.Printf("it asks for them.\n\n")
 	fmt.Printf("Anyone who has those words can read everything you copy. Read them out\n")
 	fmt.Printf("loud or type them in by hand — don't paste them through anything you\n")
-	fmt.Printf("don't control.\n\n")
+	fmt.Printf("don't control. `henri join <words>` still works, but a command line is\n")
+	fmt.Printf("readable by every other user on the machine and your shell writes it\n")
+	fmt.Printf("into its history file, so it is the worse way to move a group key.\n\n")
 	fmt.Printf("Then start the daemon on each device:  henri daemon\n")
 	if err := clipboard.Available(); err != nil {
 		fmt.Printf("\nHeads up: %v\n", err)
@@ -157,15 +270,18 @@ func cmdInit(args []string) error {
 
 func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ContinueOnError)
-	name := fs.String("name", defaultDeviceName(), "name for this device")
+	name := fs.String("name", "", "name for this device (default: this machine's hostname)")
 	port := fs.Int("port", config.DefaultListenPort, "TCP port to receive clipboard updates on")
 	discovery := fs.Bool("discovery", true, "find other devices on the LAN automatically")
 	force := fs.Bool("force", false, "overwrite an existing config")
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseFlags(fs, args, "henri join [flags] [<word> <word> ...]"); done || err != nil {
 		return err
 	}
-	if fs.NArg() == 0 {
-		return errors.New("usage: henri join <word> <word> ...  (the words `henri init` printed)")
+	if err := checkFlagsCameFirst(fs); err != nil {
+		return err
+	}
+	if err := checkPortFlag(*port); err != nil {
+		return err
 	}
 
 	path, err := config.Path()
@@ -177,20 +293,34 @@ func cmdJoin(args []string) error {
 	}
 
 	// The words can arrive as separate arguments or as one quoted string, and
-	// older releases handed out a base64 join code instead.
+	// older releases handed out a base64 join code instead. With none of them
+	// on the command line they are asked for, which is the form worth using.
 	input := strings.Join(fs.Args(), " ")
+	if fs.NArg() == 0 {
+		if input, err = readPhrase(); err != nil {
+			return err
+		}
+	}
+
 	var cfg *config.Config
 	if strings.HasPrefix(strings.TrimSpace(input), legacyCodePrefix) {
-		cfg, err = joinLegacyCode(input, *name)
+		cfg, err = joinLegacyCode(input, deviceName(*name))
 	} else {
-		cfg, err = config.Join(input, *name)
+		cfg, err = config.Join(input, deviceName(*name))
 	}
 	if err != nil {
 		return err
 	}
 
-	cfg.ListenPort = *port
-	cfg.Discovery = *discovery
+	// -port only wins when it was actually typed. A legacy join code carries
+	// the port the group was created on, and overwriting that with the flag's
+	// default silently rejoined those groups on 47600 instead.
+	if flagWasGiven(fs, "port") {
+		cfg.ListenPort = *port
+	}
+	if flagWasGiven(fs, "discovery") {
+		cfg.Discovery = *discovery
+	}
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -207,7 +337,80 @@ func cmdJoin(args []string) error {
 	return nil
 }
 
-func cmdCode() error {
+// checkFlagsCameFirst rejects a flag written after the words.
+//
+// Go's flag package stops at the first argument that is not a flag, and
+// mnemonic.Split throws away everything that is not a letter -- so `henri join
+// <14 words> -force` became fifteen tokens, every one of them a real BIP-39
+// word ("force" and "name" both are), and the user was told their phrase did
+// not check out and that one of the words was probably in the wrong place.
+// Their phrase was perfect.
+func checkFlagsCameFirst(fs *flag.FlagSet) error {
+	for _, a := range fs.Args() {
+		if strings.HasPrefix(a, "-") {
+			return fmt.Errorf("%q came after the words, so henri would have read it as one of them "+
+				"rather than as a flag.\n"+
+				"       Flags go first:  henri join -name laptop <words>", a)
+		}
+	}
+	return nil
+}
+
+// readPhrase asks for the recovery phrase rather than taking it from the
+// command line.
+//
+// Everything in argv is readable by every other user on the machine through
+// `ps auxww`, and the shell writes it to a history file, so `henri join
+// <words>` hands the group key to anyone who looks later. This is the form to
+// use. The command-line one still works: it is in the README and in people's
+// fingers, and it is the only place a phrase should still be accepted that way.
+//
+// The words are echoed as they are typed. Turning the echo off needs the
+// terminal put into raw mode, which the standard library does not do, and it
+// would be the wrong trade anyway: this is a phrase read off another screen and
+// checked word by word on the way in.
+func readPhrase() (string, error) {
+	if isTerminal(os.Stdin) {
+		fmt.Print("Recovery phrase (the words `henri init` printed): ")
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && strings.TrimSpace(line) == "" {
+			fmt.Println()
+			return "", errors.New("no recovery phrase given")
+		}
+		return strings.TrimSpace(line), nil
+	}
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", err
+	}
+	phrase := strings.TrimSpace(string(raw))
+	if phrase == "" {
+		return "", errors.New("no recovery phrase on standard input.\n" +
+			"       Run `henri join` in a terminal and type the words, or pipe them in:\n" +
+			"       henri join < phrase.txt")
+	}
+	return phrase, nil
+}
+
+// isTerminal reports whether f is a terminal rather than a pipe or a file, so
+// henri knows whether there is anyone there to prompt.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func cmdCode(args []string) error {
+	// A FlagSet even though there are no flags, because without one the
+	// dispatcher never gave this command a chance to answer `-h`: `henri code
+	// -h` printed all fifteen words and the whole `henri join` line to stdout
+	// and exited 0. That phrase is the group key, and someone asking for help
+	// is often doing it in a shared terminal, a screen recording or a CI log.
+	if done, err := bareCommand("code", args); done || err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -217,20 +420,24 @@ func cmdCode() error {
 			"phrase to show; re-run `henri init` on one device and `henri join` on the rest to move over")
 	}
 	fmt.Print(formatPhrase(cfg.Phrase))
-	fmt.Printf("\n  henri join %s\n", cfg.Phrase)
+	fmt.Printf("\nOn another device, run `henri join` and type them in when it asks.\n")
 	return nil
 }
 
 // formatPhrase lays the words out numbered, four to a row, so they are easy to
-// read off one screen while typing them into another.
+// read off one screen while typing them into another. The padding on the last
+// word of each row is trimmed: it was invisible, but it put trailing whitespace
+// on every line of something people copy, paste and diff.
 func formatPhrase(phrase string) string {
 	w := mnemonic.Split(phrase)
 	var b strings.Builder
 	for i := 0; i < len(w); i += 4 {
-		b.WriteString("  ")
+		var row strings.Builder
 		for j := i; j < i+4 && j < len(w); j++ {
-			b.WriteString(fmt.Sprintf("%3d. %-11s", j+1, w[j]))
+			fmt.Fprintf(&row, "%3d. %-11s", j+1, w[j])
 		}
+		b.WriteString("  ")
+		b.WriteString(strings.TrimRight(row.String(), " "))
 		b.WriteString("\n")
 	}
 	return b.String()
@@ -246,7 +453,7 @@ type legacyCode struct {
 	P int    `json:"p,omitempty"`
 }
 
-func joinLegacyCode(code, deviceName string) (*config.Config, error) {
+func joinLegacyCode(code, device string) (*config.Config, error) {
 	code = strings.TrimSpace(code)
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(code, legacyCodePrefix))
 	if err != nil {
@@ -256,18 +463,29 @@ func joinLegacyCode(code, deviceName string) (*config.Config, error) {
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, fmt.Errorf("that join code is damaged: %w", err)
 	}
-	device, err := config.NewDeviceID()
+	// The port in the code is the port the group was created on. It was parsed
+	// and then thrown away, so a group on anything but 47600 rejoined on the
+	// wrong one and silently never synced.
+	listen := config.DefaultListenPort
+	if p.P != 0 {
+		if p.P < 1 || p.P > 65535 {
+			return nil, fmt.Errorf("that join code names port %d, which is not a port", p.P)
+		}
+		listen = p.P
+	}
+	id, err := config.NewDeviceID()
 	if err != nil {
 		return nil, err
 	}
 	return &config.Config{
 		GroupID:       p.G,
 		Key:           p.K,
-		DeviceID:      device,
-		DeviceName:    deviceName,
-		ListenPort:    config.DefaultListenPort,
+		DeviceID:      id,
+		DeviceName:    device,
+		ListenPort:    listen,
 		DiscoveryPort: config.DefaultDiscoveryPort,
 		Discovery:     true,
+		Peers:         []string{},
 		PollMillis:    config.DefaultPollMillis,
 		MaxBytes:      config.DefaultMaxBytes,
 	}, nil
@@ -278,7 +496,10 @@ func joinLegacyCode(code, deviceName string) (*config.Config, error) {
 func cmdDaemon(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	verbose := fs.Bool("verbose", false, "log every decision, including rejected connections")
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseFlags(fs, args, "henri daemon [flags]"); done || err != nil {
+		return err
+	}
+	if err := noArgs(fs); err != nil {
 		return err
 	}
 
@@ -349,7 +570,10 @@ func loadConfigWatched() (*config.Config, error) {
 
 // --- status ----------------------------------------------------------------
 
-func cmdStatus() error {
+func cmdStatus(args []string) error {
+	if done, err := bareCommand("status", args); done || err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -362,9 +586,12 @@ func cmdStatus() error {
 			fmt.Printf("  group    %s\n\n", cfg.GroupID)
 			fmt.Printf("Start it with:  henri daemon\n")
 			fmt.Printf("Or in the background at login:  henri service install\n")
-			return nil
+			// Everything above is on stdout and reads as intended; only the
+			// exit status says the daemon is down, which is what a wait loop
+			// has to be able to see.
+			return errSaidItAlready
 		}
-		return err
+		return daemonQueryError(cfg.ListenPort, err)
 	}
 	st := resp.State
 	if st == nil {
@@ -372,15 +599,15 @@ func cmdStatus() error {
 	}
 
 	fmt.Printf("henri  ● running\n\n")
-	fmt.Printf("  device     %s  (%s)\n", st.Name, st.Device)
-	fmt.Printf("  group      %s\n", st.Group)
+	fmt.Printf("  device     %s  (%s)\n", safe(st.Name, maxName), safe(st.Device, maxName))
+	fmt.Printf("  group      %s\n", safe(st.Group, maxName))
 	if st.ClipboardErr != "" {
-		fmt.Printf("  clipboard  %s  ⚠ not readable: %s\n", st.Tool, st.ClipboardErr)
+		fmt.Printf("  clipboard  %s  ⚠ not readable: %s\n", safe(st.Tool, maxName), safe(st.ClipboardErr, maxDetail))
 	} else {
-		fmt.Printf("  clipboard  %s\n", st.Tool)
+		fmt.Printf("  clipboard  %s\n", safe(st.Tool, maxName))
 	}
 	if st.WatchMode != "" {
-		fmt.Printf("  watching   %s\n", st.WatchMode)
+		fmt.Printf("  watching   %s\n", safe(st.WatchMode, maxDetail))
 	}
 	if strings.HasPrefix(st.WatchMode, "press-to-send") {
 		defer func() {
@@ -390,94 +617,164 @@ func cmdStatus() error {
 			fmt.Printf("\nThat key copies whatever you have highlighted and sends it in one press.\n")
 		}()
 	}
-	fmt.Printf("  listening  :%d   discovery %s\n", st.ListenPort, onOff(st.Discovery))
+	fmt.Printf("  listening  :%d\n", st.ListenPort)
+	fmt.Printf("  discovery  %s\n", discoveryLine(st))
 	fmt.Printf("  uptime     %s   pid %d\n", since(st.StartedAt), st.PID)
 	fmt.Printf("  traffic    %d sent · %d received\n", st.Sent, st.Received)
 	if st.LastSyncAt != 0 {
-		fmt.Printf("  last       %s from %s, %s ago\n", humanBytes(st.LastBytes), st.LastFrom, since(st.LastSyncAt))
+		fmt.Printf("  last       %s from %s, %s ago\n",
+			humanBytes(st.LastBytes), safe(st.LastFrom, maxName), since(st.LastSyncAt))
 	} else {
 		fmt.Printf("  last       nothing synced yet\n")
 	}
 	fmt.Println()
 	printPeers(st.Peers)
+	if w := discoveryWarning(st); w != "" {
+		fmt.Println()
+		fmt.Print(w)
+	}
 	return nil
+}
+
+// discoveryLine says whether discovery is on and, more usefully, whether it is
+// hearing anything.
+//
+// "discovery on" on its own is what a daemon whose multicast membership has
+// been dropped goes on printing while it hears nothing at all -- for seventeen
+// minutes, in the case this line exists because of. The beacon count and the
+// age of the last one are what make the difference visible.
+func discoveryLine(st *node.State) string {
+	if !st.Discovery {
+		return "off"
+	}
+	line := fmt.Sprintf("on · %d beacons", st.Beacons)
+	if st.LastBeaconAt != 0 {
+		return line + " · last " + since(st.LastBeaconAt) + " ago"
+	}
+	return line + " · none heard yet"
+}
+
+// deafFor is how long `henri status` waits before saying discovery looks
+// broken. Devices announce themselves every ten seconds, so two minutes is a
+// dozen missed in a row: long enough that a laptop waking up or a moment of
+// packet loss says nothing, short enough to catch the failure while the user is
+// still looking at the screen.
+const deafFor = 2 * time.Minute
+
+// discoveryWarning explains a silent network, or returns "" when there is
+// nothing to explain.
+func discoveryWarning(st *node.State) string {
+	if !st.Discovery {
+		return ""
+	}
+	// With nothing ever heard, the daemon's own uptime is how long the silence
+	// has lasted. A daemon that started ten seconds ago has not had a chance.
+	last := st.LastBeaconAt
+	if last == 0 {
+		last = st.StartedAt
+	}
+	if last == 0 || time.Since(time.UnixMilli(last)) < deafFor {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "⚠  Discovery is on, but nothing has been heard for %s.\n\n", since(last))
+	fmt.Fprintf(&b, "   Devices announce themselves every 10 seconds, so either nothing else in\n")
+	fmt.Fprintf(&b, "   this group is running, or this device has stopped hearing them: a Wi-Fi\n")
+	fmt.Fprintf(&b, "   roam, a suspend or a VPN coming up drops the multicast membership without\n")
+	fmt.Fprintf(&b, "   telling the socket. henri takes it out again about once a minute.\n\n")
+	fmt.Fprintf(&b, "   If another device is definitely running, check `henri status` there, and\n")
+	fmt.Fprintf(&b, "   that UDP %d is allowed on both. To stop depending on multicast:\n\n", config.DefaultDiscoveryPort)
+	fmt.Fprintf(&b, "       henri peers add <host:port>\n")
+	return b.String()
+}
+
+// daemonQueryError names the port when a conversation with the local daemon
+// fails for any reason other than nothing being there.
+//
+// ErrNotRunning is only returned for a refused connection. Everything else --
+// another program holding the port, a half-open socket, something that is not
+// henri answering -- arrived as a bare `henri: EOF`, which says nothing about
+// where to look.
+func daemonQueryError(port int, err error) error {
+	return fmt.Errorf("the daemon on 127.0.0.1:%d did not answer: %w\n"+
+		"       Something is listening on that port but is not replying as henri does.\n"+
+		"       Check what has it (lsof -i :%d), or set listen_port in the config to\n"+
+		"       something else and restart the daemon", port, err, port)
 }
 
 // --- peers -----------------------------------------------------------------
 
 func cmdPeers(args []string) error {
+	sub, addr, done, err := parsePeersArgs(args)
+	if done || err != nil {
+		return err
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 
-	if len(args) > 0 {
-		switch args[0] {
-		case "add":
-			if len(args) != 2 {
-				return errors.New("usage: henri peers add <host:port>")
-			}
-			addr, err := normalizeAddr(args[1], cfg.ListenPort)
-			if err != nil {
-				return err
-			}
-			for _, p := range cfg.Peers {
-				if p == addr {
-					fmt.Printf("%s is already a peer.\n", addr)
-					return nil
-				}
-			}
-			cfg.Peers = append(cfg.Peers, addr)
-			if err := cfg.Save(); err != nil {
-				return err
-			}
-			fmt.Printf("Added %s. Restart the daemon to pick it up.\n", addr)
-			return nil
-		case "rm", "remove":
-			if len(args) != 2 {
-				return errors.New("usage: henri peers rm <host:port>")
-			}
-			addr, err := normalizeAddr(args[1], cfg.ListenPort)
-			if err != nil {
-				return err
-			}
-			kept := cfg.Peers[:0]
-			found := false
-			for _, p := range cfg.Peers {
-				if p == addr {
-					found = true
-					continue
-				}
-				kept = append(kept, p)
-			}
-			if !found {
-				return fmt.Errorf("%s is not in the peer list", addr)
-			}
-			cfg.Peers = kept
-			if err := cfg.Save(); err != nil {
-				return err
-			}
-			fmt.Printf("Removed %s. Restart the daemon to pick it up.\n", addr)
-			return nil
-		default:
-			return fmt.Errorf("unknown peers subcommand %q", args[0])
+	switch sub {
+	case "add":
+		addr, err := normalizeAddr(addr, cfg.ListenPort)
+		if err != nil {
+			return err
 		}
+		for _, p := range cfg.Peers {
+			if p == addr {
+				fmt.Printf("%s is already a peer.\n", addr)
+				return nil
+			}
+		}
+		cfg.Peers = append(cfg.Peers, addr)
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Added %s. Restart the daemon to pick it up.\n", addr)
+		return nil
+	case "rm":
+		addr, err := normalizeAddr(addr, cfg.ListenPort)
+		if err != nil {
+			return err
+		}
+		kept := cfg.Peers[:0]
+		found := false
+		for _, p := range cfg.Peers {
+			if p == addr {
+				found = true
+				continue
+			}
+			kept = append(kept, p)
+		}
+		if !found {
+			return fmt.Errorf("%s is not in the peer list", addr)
+		}
+		cfg.Peers = kept
+		if err := cfg.Save(); err != nil {
+			return err
+		}
+		fmt.Printf("Removed %s. Restart the daemon to pick it up.\n", addr)
+		return nil
 	}
 
 	resp, err := node.Query(cfg, node.KindStatus)
 	if err != nil {
 		if errors.Is(err, node.ErrNotRunning) {
+			// Listing what the config says is a complete answer to `henri
+			// peers`, so unlike `henri status` this is not a failure.
 			if len(cfg.Peers) == 0 {
 				fmt.Println("The daemon is not running and no peers are configured.")
 				return nil
 			}
 			fmt.Println("The daemon is not running. Peers from the config:")
+			fmt.Println()
 			for _, p := range cfg.Peers {
-				fmt.Printf("  ○ %-28s config\n", p)
+				fmt.Println(peerLine("○", "—", p, "config", "never"))
 			}
 			return nil
 		}
-		return err
+		return daemonQueryError(cfg.ListenPort, err)
 	}
 	if resp.State == nil {
 		return errors.New("the daemon replied without any status")
@@ -486,15 +783,69 @@ func cmdPeers(args []string) error {
 	return nil
 }
 
+// parsePeersArgs validates a `henri peers ...` invocation. sub is "", "add" or
+// "rm"; addr is set for the two that take one.
+//
+// Split out from cmdPeers so that the argument handling can be tested without
+// a config, a daemon or a network.
+func parsePeersArgs(args []string) (sub, addr string, done bool, err error) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		fs := flag.NewFlagSet("peers", flag.ContinueOnError)
+		if done, err := parseFlags(fs, args, "henri peers [add|rm <host:port>]"); done || err != nil {
+			return "", "", done, err
+		}
+		return "", "", false, noArgs(fs)
+	}
+
+	switch args[0] {
+	case "add":
+		sub = "add"
+	case "rm", "remove":
+		sub = "rm"
+	default:
+		return "", "", false, fmt.Errorf("unknown peers subcommand %q (try add, rm, or `henri peers` on its own to list)", args[0])
+	}
+
+	fs := flag.NewFlagSet("peers "+sub, flag.ContinueOnError)
+	if done, err := parseFlags(fs, args[1:], "henri peers "+sub+" <host:port>"); done || err != nil {
+		return "", "", done, err
+	}
+	if fs.NArg() != 1 {
+		return "", "", false, fmt.Errorf("usage: henri peers %s <host:port>", sub)
+	}
+	return sub, fs.Arg(0), false, nil
+}
+
+// peerLine is the one layout for a device in a list. The running daemon's list
+// and the config's used to be laid out differently, which made two views of the
+// same thing look like two different programs.
+func peerLine(mark, name, addr, source, last string) string {
+	return "  " + mark + " " + pad(name, 18) + " " + pad(addr, 22) + " " + pad(source, 11) + " " + last
+}
+
+// pad left-aligns s in a column n characters wide.
+//
+// fmt's %-18s counts bytes rather than characters, so a device name with an
+// accent in it -- or the em dash henri prints for a device whose name it does
+// not know -- pushed every column after it out of line. Counting runes is right
+// for everything but the double-width glyphs of CJK and emoji, which the
+// standard library gives no way to measure.
+func pad(s string, n int) string {
+	if w := len([]rune(s)); w < n {
+		return s + strings.Repeat(" ", n-w)
+	}
+	return s
+}
+
 func printPeers(peers []node.PeerInfo) {
+	fmt.Println("peers")
 	if len(peers) == 0 {
-		fmt.Println("peers      none yet")
+		fmt.Println("  none yet")
 		fmt.Println()
 		fmt.Println("Devices on the same network find each other automatically.")
 		fmt.Println("For anything else:  henri peers add <host:port>")
 		return
 	}
-	fmt.Println("peers")
 	for _, p := range peers {
 		mark := "○"
 		last := "never"
@@ -502,11 +853,11 @@ func printPeers(peers []node.PeerInfo) {
 			mark = "●"
 			last = since(p.LastSeenAt) + " ago"
 		}
-		name := p.Name
+		name := safe(p.Name, maxName)
 		if name == "" {
 			name = "—"
 		}
-		fmt.Printf("  %s %-18s %-22s %-11s %s\n", mark, name, p.Addr, p.Source, last)
+		fmt.Println(peerLine(mark, name, safe(p.Addr, maxAddr), p.Source, last))
 	}
 }
 
@@ -516,7 +867,10 @@ func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	highlighted := fs.Bool("highlighted", false,
 		"send the highlighted text (the PRIMARY selection) and copy it here too, rather than the clipboard")
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseFlags(fs, args, "henri send [-highlighted]"); done || err != nil {
+		return err
+	}
+	if err := noArgs(fs); err != nil {
 		return err
 	}
 	cfg, err := config.Load()
@@ -524,13 +878,26 @@ func cmdSend(args []string) error {
 		return err
 	}
 	if _, err := node.QueryPush(cfg, *highlighted); err != nil {
-		return err
+		if errors.Is(err, node.ErrNotRunning) {
+			return err
+		}
+		return daemonQueryError(cfg.ListenPort, err)
 	}
-	if *highlighted {
-		fmt.Println("Copied the highlighted text and sent it to the group.")
-	} else {
+	if !*highlighted {
 		fmt.Println("Sent the current clipboard to the group.")
+		return nil
 	}
+	// This used to say "Copied the highlighted text and sent it" on the
+	// strength of the flag alone. Where there is no PRIMARY selection at all --
+	// macOS and Windows -- the daemon sends the clipboard and writes nothing
+	// locally, so the message was simply untrue and the next paste was stale.
+	if !clipboard.HasPrimary() {
+		fmt.Println("This system has no separate selection for highlighted text, so henri sent")
+		fmt.Println("the clipboard instead. Nothing was copied to this device.")
+		return nil
+	}
+	fmt.Println("Sent the highlighted text to the group and copied it here.")
+	fmt.Println("(With nothing highlighted, henri sends the clipboard and copies nothing.)")
 	return nil
 }
 
@@ -540,7 +907,10 @@ func cmdLeave(args []string) error {
 	fs := flag.NewFlagSet("leave", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
 	force := fs.Bool("force", false, "remove the config even while the daemon is running")
-	if err := fs.Parse(args); err != nil {
+	if done, err := parseFlags(fs, args, "henri leave [flags]"); done || err != nil {
+		return err
+	}
+	if err := noArgs(fs); err != nil {
 		return err
 	}
 
@@ -561,8 +931,17 @@ func cmdLeave(args []string) error {
 			"       or re-run with -force if you know it is about to stop")
 	}
 
-	fmt.Printf("This removes %s\n\n", path)
-	fmt.Printf("  device   %s\n", cfg.DeviceName)
+	fmt.Printf("This removes %s\n", path)
+	// Where the config is itself a symlink, the file it links to goes as well:
+	// taking only the link would leave the group key in the dotfiles directory
+	// it came from. Only the last component counts -- a resolved parent
+	// directory is the same file under another name, not a second one.
+	if fi, lerr := os.Lstat(path); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if resolved, rerr := config.ResolvedPath(); rerr == nil && resolved != path {
+			fmt.Printf("and the file it links to, %s\n", resolved)
+		}
+	}
+	fmt.Printf("\n  device   %s\n", cfg.DeviceName)
 	fmt.Printf("  group    %s\n\n", cfg.GroupID)
 
 	if cfg.Phrase != "" {
@@ -615,22 +994,18 @@ func confirm(question string) (bool, error) {
 // --- service ---------------------------------------------------------------
 
 func cmdService(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: henri service <install|uninstall|restart|status|logs>")
+	sub, force, done, err := parseServiceArgs(args)
+	if done || err != nil {
+		return err
 	}
 	mgr, err := service.New()
 	if err != nil {
 		return err
 	}
-	switch args[0] {
-	case "install", "enable":
-		fs := flag.NewFlagSet("service install", flag.ContinueOnError)
-		force := fs.Bool("force", false, "install even if the binary is somewhere that may not always be there")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		return cmdServiceInstall(mgr, *force)
-	case "uninstall", "remove", "disable":
+	switch sub {
+	case "install":
+		return cmdServiceInstall(mgr, force)
+	case "uninstall":
 		return cmdServiceUninstall(mgr)
 	case "restart":
 		if err := mgr.Restart(); err != nil {
@@ -640,11 +1015,50 @@ func cmdService(args []string) error {
 		return nil
 	case "status":
 		return cmdServiceStatus(mgr)
-	case "logs":
+	default: // "logs"
 		return cmdServiceLogs(mgr)
-	default:
-		return fmt.Errorf("unknown service command %q (try install, uninstall, restart, status or logs)", args[0])
 	}
+}
+
+// parseServiceArgs validates a `henri service ...` invocation and does nothing
+// else. It returns the canonical subcommand name.
+//
+// It is separate from cmdService on purpose: this is the half that can be
+// tested, because the other half installs and removes real launchd agents and
+// systemd user units. It is also why the flags are parsed before the service
+// manager is asked for -- only `install` ever had a FlagSet, so `henri service
+// uninstall --nope` went straight through and removed the service, reporting
+// only that it had done so.
+func parseServiceArgs(args []string) (sub string, force, done bool, err error) {
+	if len(args) == 0 {
+		return "", false, false, errors.New("usage: henri service <install|uninstall|restart|status|logs>")
+	}
+	switch args[0] {
+	case "install", "enable":
+		fs := flag.NewFlagSet("service install", flag.ContinueOnError)
+		f := fs.Bool("force", false, "install even if the binary is somewhere that may not always be there")
+		if done, err := parseFlags(fs, args[1:], "henri service install [-force]"); done || err != nil {
+			return "", false, done, err
+		}
+		if err := noArgs(fs); err != nil {
+			return "", false, false, err
+		}
+		return "install", *f, false, nil
+	case "uninstall", "remove", "disable":
+		sub = "uninstall"
+	case "restart":
+		sub = "restart"
+	case "status":
+		sub = "status"
+	case "logs":
+		sub = "logs"
+	default:
+		return "", false, false, fmt.Errorf("unknown service command %q (try install, uninstall, restart, status or logs)", args[0])
+	}
+	if done, err := bareCommand("service "+args[0], args[1:]); done || err != nil {
+		return "", false, done, err
+	}
+	return sub, false, false, nil
 }
 
 func cmdServiceInstall(mgr service.Manager, force bool) error {
@@ -668,8 +1082,8 @@ func cmdServiceInstall(mgr service.Manager, force bool) error {
 		fmt.Printf("     henri would fail to start whenever it is not mounted.\n\n")
 		fmt.Printf("     Install it somewhere permanent first, then install the service\n")
 		fmt.Printf("     from there:\n\n")
-		fmt.Printf("         make build && sudo make install\n")
-		fmt.Printf("         %s/bin/henri service install\n\n", "/usr/local")
+		fmt.Printf("         make build && sudo make install   # or PREFIX=$HOME/.local, without sudo\n")
+		fmt.Printf("         henri service install             # run the installed copy, not this one\n\n")
 		return errors.New("refusing to point a login service at a volatile path (use -force to insist)")
 	}
 
@@ -715,13 +1129,23 @@ func cmdServiceInstall(mgr service.Manager, force bool) error {
 	}
 	fmt.Println()
 
-	st, _ := mgr.Status()
+	st, sterr := mgr.Status()
 	if !up {
 		fmt.Printf("\nInstalled, but it has not answered yet.\n")
+		// The status error was thrown away here, at exactly the moment the user
+		// most needs to know what the service manager thinks -- and then the
+		// empty LogHint that came with it was printed as a command to run.
+		if sterr != nil {
+			fmt.Printf("  asking %s about it failed: %v\n", mgr.Name(), sterr)
+		}
 		if st.Detail != "" {
 			fmt.Printf("  %s reports: %s\n", mgr.Name(), st.Detail)
 		}
-		fmt.Printf("\nCheck the logs:  %s\n", st.LogHint)
+		if st.LogHint != "" {
+			fmt.Printf("\nCheck the logs:  %s\n", st.LogHint)
+		} else {
+			fmt.Printf("\nRun `henri daemon` in a terminal to see what it is failing on.\n")
+		}
 		return nil
 	}
 
@@ -734,7 +1158,14 @@ func cmdServiceInstall(mgr service.Manager, force bool) error {
 }
 
 func cmdServiceUninstall(mgr service.Manager) error {
-	st, _ := mgr.Status()
+	st, err := mgr.Status()
+	if err != nil {
+		// Without an answer there is no telling "nothing is installed" from
+		// "the service manager is not talking", and the two want opposite
+		// things done. Discarding the error meant the first was reported for
+		// both, so a busy systemctl looked like a clean machine.
+		return fmt.Errorf("could not ask %s whether henri is installed: %w", mgr.Name(), err)
+	}
 	if !st.Installed {
 		fmt.Println("No henri service is installed.")
 		return nil
@@ -779,11 +1210,17 @@ func cmdServiceLogs(mgr service.Manager) error {
 	if err != nil {
 		return err
 	}
-	parts := strings.Fields(st.LogHint)
-	if len(parts) == 0 {
+	// LogCmd, not strings.Fields(LogHint). The hint is a line for a person to
+	// read and it contains paths: a home directory with a space in it turned
+	// one argument into two, and the log command failed on a machine where the
+	// printed hint was perfectly correct.
+	if len(st.LogCmd) == 0 {
+		if st.LogHint != "" {
+			return fmt.Errorf("henri cannot follow the logs for you on this platform; run:  %s", st.LogHint)
+		}
 		return errors.New("no log command for this platform")
 	}
-	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd := exec.Command(st.LogCmd[0], st.LogCmd[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -793,40 +1230,82 @@ func cmdServiceLogs(mgr service.Manager) error {
 // --- hotkey ----------------------------------------------------------------
 
 func cmdHotkey(args []string) error {
-	if len(args) == 0 {
-		args = []string{"status"}
-	}
-	fs := flag.NewFlagSet("hotkey", flag.ContinueOnError)
-	accel := fs.String("accel", hotkey.DefaultAccel, "the shortcut to bind, in GNOME accelerator syntax")
-	if err := fs.Parse(args[1:]); err != nil {
+	sub, accel, done, err := parseHotkeyArgs(args)
+	if done || err != nil {
 		return err
 	}
-
-	switch args[0] {
-	case "install", "add", "enable":
-		return cmdHotkeyInstall(*accel)
-	case "uninstall", "remove", "disable":
-		if err := hotkey.Uninstall(); err != nil {
+	switch sub {
+	case "install":
+		return cmdHotkeyInstall(accel)
+	case "uninstall":
+		removed, err := hotkey.UninstallReport()
+		if err != nil {
 			if errors.Is(err, hotkey.ErrManual) {
 				return fmt.Errorf("henri did not set up a shortcut on %s, so there is nothing to remove", hotkey.Desktop())
 			}
 			return err
 		}
+		// Uninstall returned nil whether or not there had been a binding, so
+		// henri thanked people for removing a shortcut they never had.
+		if !removed {
+			fmt.Printf("henri had no shortcut bound on %s, so there was nothing to remove.\n", hotkey.Desktop())
+			return nil
+		}
 		fmt.Println("Removed henri's shortcut.")
 		return nil
-	case "status":
-		return cmdHotkeyStatus(*accel)
-	default:
-		return fmt.Errorf("unknown hotkey command %q (try install, uninstall or status)", args[0])
+	default: // "status"
+		return cmdHotkeyStatus(accel)
 	}
 }
 
-func cmdHotkeyInstall(accel string) error {
-	binary, err := service.BinaryPath()
-	if err != nil {
-		return err
+// parseHotkeyArgs validates a `henri hotkey ...` invocation, so that a flag
+// typed after the subcommand is reported rather than dropped.
+func parseHotkeyArgs(args []string) (sub, accel string, done bool, err error) {
+	sub = "status"
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "install", "add", "enable":
+			sub = "install"
+		case "uninstall", "remove", "disable":
+			sub = "uninstall"
+		case "status":
+			sub = "status"
+		default:
+			return "", "", false, fmt.Errorf("unknown hotkey command %q (try install, uninstall or status)", args[0])
+		}
+		rest = args[1:]
 	}
-	command := binary + " send -highlighted"
+
+	fs := flag.NewFlagSet("hotkey "+sub, flag.ContinueOnError)
+	a := fs.String("accel", hotkey.DefaultAccel, "the shortcut to bind, in GNOME accelerator syntax")
+	if done, err := parseFlags(fs, rest, "henri hotkey [install|uninstall|status] [-accel <shortcut>]"); done || err != nil {
+		return "", "", done, err
+	}
+	if err := noArgs(fs); err != nil {
+		return "", "", false, err
+	}
+	return sub, *a, false, nil
+}
+
+// sendCommand is what a hotkey is bound to: copy the highlighted text and send
+// it in one press.
+//
+// One function because `hotkey install` and `hotkey status` have to agree.
+// Status printed `henri send` instead, which is the command that sends the
+// clipboard -- so on every desktop henri cannot script, which is the entire
+// point of the feature, the instructions told people to bind a key that did
+// nothing until they had also pressed Ctrl+C.
+func sendCommand() string {
+	binary, err := service.BinaryPath()
+	if err != nil || binary == "" {
+		binary = "henri"
+	}
+	return binary + " send -highlighted"
+}
+
+func cmdHotkeyInstall(accel string) error {
+	command := sendCommand()
 
 	if err := hotkey.Install(command, accel); err != nil {
 		if errors.Is(err, hotkey.ErrManual) {
@@ -858,9 +1337,8 @@ func cmdHotkeyStatus(accel string) error {
 	fmt.Printf("henri hotkey\n\n")
 	fmt.Printf("  desktop    %s\n", st.Desktop)
 	if errors.Is(err, hotkey.ErrManual) {
-		binary, _ := service.BinaryPath()
 		fmt.Printf("  managed    no — henri cannot script shortcuts here\n\n")
-		fmt.Print(hotkey.Instructions(binary+" send", accel))
+		fmt.Print(hotkey.Instructions(sendCommand(), accel))
 		return nil
 	}
 	if !st.Installed {
@@ -875,33 +1353,101 @@ func cmdHotkeyStatus(accel string) error {
 
 // --- helpers ---------------------------------------------------------------
 
-func defaultDeviceName() string {
+// deviceName resolves the -name flag, falling back to the hostname. Looked up
+// only when it is needed: as the default of the flag itself it ran on every
+// init and join, including the ones that gave a name and never used it.
+func deviceName(given string) string {
+	if given != "" {
+		return given
+	}
 	if h, err := os.Hostname(); err == nil && h != "" {
 		return h
 	}
 	return "device"
 }
 
+// normalizeAddr turns what someone typed into an address henri can dial.
+//
+// It used to decide whether an address already had a port by looking for a
+// colon, which every IPv6 address is full of: `henri peers add ::1` stored
+// "::1", net.SplitHostPort rejected it later on, and the peer silently never
+// synced while `henri peers` listed it looking perfectly normal. A port that is
+// not a number, or not a port, was stored just as happily.
 func normalizeAddr(addr string, defaultPort int) (string, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return "", errors.New("the address is empty")
 	}
-	if !strings.Contains(addr, ":") {
-		return addr + ":" + strconv.Itoa(defaultPort), nil
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// No port at all, or a bare IPv6 address, which looks like one.
+		host, port = strings.Trim(addr, "[]"), strconv.Itoa(defaultPort)
 	}
-	return addr, nil
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", fmt.Errorf("%q has no host in it — an address is <host> or <host>:<port>", addr)
+	}
+	// A host with a colon left in it has to be an IPv6 literal; anything else
+	// is a mistyped address that JoinHostPort would otherwise bracket and
+	// accept. The zone after a % is part of a link-local address, not the IP.
+	if strings.Contains(host, ":") {
+		bare, _, _ := strings.Cut(host, "%")
+		if net.ParseIP(bare) == nil {
+			return "", fmt.Errorf("%q is not an address henri can dial — "+
+				"write a name or an IPv4 address as <host>:<port>, and an IPv6 one as [<address>]:<port>", addr)
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("%q does not have a usable port — it must be a number from 1 to 65535", addr)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(n)), nil
 }
 
-func onOff(b bool) string {
-	if b {
-		return "on"
+// Bounds on anything printed that another device chose. See safe.
+const (
+	maxName   = 32
+	maxAddr   = 47 // "[" + a full IPv6 address + "]:65535"
+	maxDetail = 200
+)
+
+// safe renders a string that came from somewhere else.
+//
+// Device names, addresses and clipboard error text all arrive over the network
+// or out of a helper program's stderr, and written to a terminal unfiltered an
+// escape sequence in one of them is not text at all: it can move the cursor,
+// repaint the line, or decide what every other member's `henri status` appears
+// to say. So only printable characters survive -- which excludes both the C0
+// controls and the C1 range, and the invisible formatting characters that can
+// reorder a line -- and only so many of them.
+func safe(s string, max int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range strings.TrimSpace(s) {
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		if n == max {
+			b.WriteString("…")
+			break
+		}
+		b.WriteRune(r)
+		n++
 	}
-	return "off"
+	return b.String()
 }
 
+// since renders how long ago something happened.
 func since(unixMilli int64) string {
+	// A zero timestamp is "this never happened", not 1970: since(0) used to
+	// report 496247h16m, which is the age of the epoch and not an uptime.
+	if unixMilli <= 0 {
+		return "unknown"
+	}
 	d := time.Since(time.UnixMilli(unixMilli))
+	if d < 0 {
+		d = 0
+	}
 	switch {
 	case d < time.Second:
 		return "0s"
@@ -909,20 +1455,30 @@ func since(unixMilli int64) string {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
 	case d < time.Hour:
 		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
-	default:
+	case d < 24*time.Hour:
 		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	default:
+		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
 	}
 }
 
+// humanBytes renders a byte count the way a person reads it.
+//
+// The unit table is bounded and the loop stops at the end of it. It used to
+// index a four-character string with whatever exponent the loop reached, so a
+// payload limit of a pebibyte -- reachable by hand-editing max_payload_bytes --
+// crashed the command on an index out of range rather than printing a slightly
+// silly number.
 func humanBytes(n int) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
+	const units = "KMGTPE"
 	div, exp := int64(unit), 0
-	for v := int64(n) / unit; v >= unit; v /= unit {
+	for v := int64(n) / unit; v >= unit && exp < len(units)-1; v /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGT"[exp])
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), units[exp])
 }

@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const systemdUnit = "henri.service"
+const systemdUnit = Label + ".service"
 
 type systemd struct {
 	unit string
@@ -28,7 +28,11 @@ func (s *systemd) Name() string     { return "systemd" }
 func (s *systemd) UnitPath() string { return s.unit }
 
 func (s *systemd) Install(binary string) error {
-	if err := writeUnit(s.unit, s.render(binary)); err != nil {
+	unit, err := s.render(binary)
+	if err != nil {
+		return err
+	}
+	if err := writeUnit(s.unit, unit); err != nil {
 		return err
 	}
 	if _, err := run("systemctl", "--user", "daemon-reload"); err != nil {
@@ -61,7 +65,8 @@ func (s *systemd) Status() (Status, error) {
 	st := Status{
 		Manager:  "systemd",
 		UnitPath: s.unit,
-		LogHint:  "journalctl --user -u henri -f",
+		LogHint:  "journalctl --user -u " + Label + " -f",
+		LogCmd:   []string{"journalctl", "--user", "-u", systemdUnit, "-f"},
 	}
 	if _, err := os.Stat(s.unit); err == nil {
 		st.Installed = true
@@ -76,14 +81,34 @@ func (s *systemd) Status() (Status, error) {
 	return st, nil
 }
 
-func (s *systemd) render(binary string) string {
+// systemdValue renders one value for a unit file.
+//
+// systemd does not treat everything after the "=" as the value. Whitespace
+// splits a single Environment= assignment into two, "%" introduces a specifier
+// and has to be doubled to mean itself, and the quoted form needs its own
+// quotes and backslashes escaped. Callers must have rejected newlines first;
+// nothing here can make one safe.
+func systemdValue(s string) string {
+	s = strings.ReplaceAll(s, "%", "%%")
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+	return `"` + r.Replace(s) + `"`
+}
+
+func (s *systemd) render(binary string) (string, error) {
 	captured := sessionEnv()
 	for k, v := range configEnv() {
 		captured[k] = v
 	}
+
+	if err := checkUnitValue("the henri binary path", binary); err != nil {
+		return "", err
+	}
 	var env strings.Builder
 	for _, k := range sortedKeys(captured) {
-		env.WriteString("Environment=" + k + "=" + captured[k] + "\n")
+		if err := checkUnitValue(k, captured[k]); err != nil {
+			return "", err
+		}
+		env.WriteString("Environment=" + systemdValue(k+"="+captured[k]) + "\n")
 	}
 
 	return `# Written by ` + "`henri service install`" + `. Edit with care; reinstalling overwrites it.
@@ -94,11 +119,19 @@ func (s *systemd) render(binary string) string {
 [Unit]
 Description=henri - shared clipboard
 Documentation=https://github.com/justin06lee/henri
+
+# After= on its own only orders henri against the graphical session when both
+# are being started in the same transaction, which they are not: WantedBy=
+# below is what starts henri, and pairing it with PartOf= is what makes the
+# session actually pull henri in -- after the compositor, and only once there is
+# one. Started from default.target instead, henri reliably came up with no
+# display at all.
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=` + binary + ` daemon
+ExecStart=` + systemdValue(binary) + ` daemon
 Restart=on-failure
 RestartSec=5
 
@@ -107,10 +140,14 @@ RestartSec=5
 # reach the display without them.
 ` + env.String() + `
 # The config holds the group key; keep the process from wandering.
+#
+# No PrivateTmp: X11's local transport is a socket in /tmp/.X11-unix, so a
+# private /tmp means xclip and xsel can never open the display -- and where
+# unprivileged user namespaces are off, the unit fails outright at
+# 226/NAMESPACE. The key it was meant to protect lives in ~/.config anyway.
 NoNewPrivileges=true
-PrivateTmp=true
 
 [Install]
-WantedBy=default.target
-`
+WantedBy=graphical-session.target
+`, nil
 }
