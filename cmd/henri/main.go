@@ -23,6 +23,7 @@ import (
 
 	"github.com/justin06lee/henri/internal/clipboard"
 	"github.com/justin06lee/henri/internal/config"
+	"github.com/justin06lee/henri/internal/firewall"
 	"github.com/justin06lee/henri/internal/hotkey"
 	"github.com/justin06lee/henri/internal/mnemonic"
 	"github.com/justin06lee/henri/internal/node"
@@ -66,6 +67,8 @@ func run(args []string) error {
 		return cmdDaemon(args[1:])
 	case "status":
 		return cmdStatus(args[1:])
+	case "doctor":
+		return cmdDoctor(args[1:])
 	case "peers":
 		return cmdPeers(args[1:])
 	case "send":
@@ -100,6 +103,7 @@ usage: henri <command> [flags]
   service         run henri in the background, starting at login
   hotkey          bind a key to ` + "`henri send -highlighted`" + `, for desktops henri cannot watch
   status          show what the local daemon is doing
+  doctor          check everything sync needs and say what is wrong (-fix to repair)
   peers           list known devices; ` + "`peers add|rm <host:port>`" + ` to edit
   send            send the clipboard to the group (-highlighted for the selection)
   leave           remove this device's config and leave the group
@@ -702,6 +706,210 @@ func daemonQueryError(port int, err error) error {
 		"       something else and restart the daemon", port, err, port)
 }
 
+// --- doctor ----------------------------------------------------------------
+
+// reachTimeout bounds one connection attempt to a peer. Short: this runs once
+// per peer while somebody watches, and a peer that has not answered in three
+// seconds on a local network is not going to.
+const reachTimeout = 3 * time.Second
+
+// cmdDoctor walks the whole path a copy has to travel and reports the first
+// thing in the way.
+//
+// It exists because the failures henri actually produces do not look like
+// failures. A firewall filters only inbound traffic, so a blocked device still
+// announces itself and still pushes its own clipboard out -- both machines list
+// each other as peers and sync runs in exactly one direction, which reads as a
+// bug in henri rather than as a closed port. Nothing in `henri status` said so:
+// it showed a green dot beside a peer this device had never once succeeded in
+// reaching.
+func cmdDoctor(args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fix := fs.Bool("fix", false, "offer to repair what can be repaired, rather than only reporting it")
+	if done, err := parseFlags(fs, args, "henri doctor [-fix]"); done || err != nil {
+		return err
+	}
+	if err := noArgs(fs); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	path, _ := config.Path()
+
+	fmt.Printf("henri doctor\n\n")
+	fmt.Printf("  config     %s\n", path)
+	fmt.Printf("  device     %s\n", safe(cfg.DeviceName, maxName))
+	fmt.Printf("  group      %s\n\n", safe(cfg.GroupID, maxName))
+
+	var problems []string
+
+	// The clipboard first: without it nothing else matters, and it is the one
+	// piece that fails differently under a service than it does in a terminal.
+	if err := clipboard.Available(); err != nil {
+		problems = append(problems, "Install a clipboard helper: wl-clipboard on Wayland, xclip or xsel on X11.")
+		fmt.Printf("  ✗ clipboard  %v\n", err)
+	} else if _, rerr := clipboard.Read(); rerr != nil {
+		problems = append(problems, fmt.Sprintf("The clipboard is not readable: %v\n"+
+			"     A daemon started outside your graphical session cannot reach it.", rerr))
+		fmt.Printf("  ✗ clipboard  %s, not readable: %v\n", clipboard.Tool(), rerr)
+	} else {
+		fmt.Printf("  ✓ clipboard  %s, readable\n", clipboard.Tool())
+	}
+
+	// Then the daemon, which everything after this depends on.
+	var st *node.State
+	resp, qerr := node.Query(cfg, node.KindStatus)
+	switch {
+	case qerr == nil && resp.State != nil:
+		st = resp.State
+		fmt.Printf("  ✓ daemon     running, pid %d, up %s\n", st.PID, since(st.StartedAt))
+	case errors.Is(qerr, node.ErrNotRunning):
+		fmt.Printf("  ✗ daemon     not running\n")
+		problems = append(problems, "Start the daemon:  henri service install   (or `henri daemon` in a terminal)")
+	default:
+		fmt.Printf("  ✗ daemon     did not answer on :%d: %v\n", cfg.ListenPort, qerr)
+		problems = append(problems, fmt.Sprintf("Something is on port %d that is not henri; check with `lsof -i :%d`.",
+			cfg.ListenPort, cfg.ListenPort))
+	}
+
+	if st != nil {
+		fmt.Printf("  ✓ listening  :%d\n", st.ListenPort)
+		if st.Discovery {
+			mark := "✓"
+			if st.LastBeaconAt == 0 || time.Since(time.UnixMilli(st.LastBeaconAt)) > deafFor {
+				mark = "⚠"
+				problems = append(problems, "Discovery is hearing nothing. If the other device is running, its\n"+
+					"     inbound UDP port is probably closed — see the firewall note below.")
+			}
+			fmt.Printf("  %s discovery  %s\n", mark, discoveryLine(st))
+		} else {
+			fmt.Printf("  – discovery  off (peers come from the config only)\n")
+		}
+	}
+
+	// The firewall on THIS machine governs what reaches us, which is the half
+	// of the problem the other device's owner cannot see.
+	lan := firewall.LocalNetwork()
+	fw := firewall.Detect(cfg.ListenPort, cfg.DiscoveryPort, lan)
+	switch {
+	case fw.Name == "":
+		fmt.Printf("  ✓ firewall   none found\n")
+	case !fw.Active:
+		fmt.Printf("  ✓ firewall   %s is installed but not active\n", fw.Name)
+	case fw.Blocking():
+		fmt.Printf("  ⚠ firewall   %s is active; henri's ports are %s (tcp/%d) and %s (udp/%d)\n",
+			fw.Name, fw.TCP, cfg.ListenPort, fw.UDP, cfg.DiscoveryPort)
+	default:
+		fmt.Printf("  ✓ firewall   %s is active and henri's ports are open\n", fw.Name)
+	}
+	if fw.Note != "" {
+		fmt.Printf("               %s\n", fw.Note)
+	}
+
+	// And finally the peers, one connection each. This is the check that would
+	// have named the problem straight away.
+	if st != nil {
+		fmt.Println()
+		if len(st.Peers) == 0 {
+			fmt.Printf("  no peers known yet\n")
+		}
+		for _, p := range st.Peers {
+			name := safe(p.Name, maxName)
+			if name == "" {
+				name = safe(p.Addr, maxAddr)
+			}
+			ok, reason := firewall.Reach(p.Addr, reachTimeout)
+			if ok {
+				fmt.Printf("  ✓ %-16s %s\n", name, safe(p.Addr, maxAddr))
+				continue
+			}
+			fmt.Printf("  ✗ %-16s %s\n", name, safe(p.Addr, maxAddr))
+			fmt.Printf("    %s\n", reason)
+			problems = append(problems, fmt.Sprintf("henri on %s cannot be reached. That is a firewall on THAT machine,\n"+
+				"     not this one — open tcp/%d and udp/%d there. `henri doctor -fix` on\n"+
+				"     that device will do it.", name, cfg.ListenPort, cfg.DiscoveryPort))
+		}
+	}
+
+	if len(problems) == 0 && !fw.Blocking() {
+		fmt.Printf("\nEverything checks out.\n")
+		return nil
+	}
+
+	fmt.Printf("\nwhat to do\n\n")
+	for i, p := range problems {
+		fmt.Printf("  %d. %s\n\n", i+1, p)
+	}
+
+	// Only offer -fix when there is something on THIS machine to fix. The
+	// common case is the opposite one -- the closed port is on the device that
+	// cannot be reached -- and telling the user to run -fix here would send
+	// them to the wrong machine.
+	if len(fw.OpenCmds) > 0 {
+		return offerFirewall(fw, *fix)
+	}
+	fmt.Printf("Nothing here needs henri's help; the fix is on the other device.\n")
+	return nil
+}
+
+// offerFirewall prints the commands that open henri's ports, and with -fix runs
+// them after asking. henri never edits a firewall without being told to twice:
+// once by the flag, once by the answer.
+func offerFirewall(fw firewall.Status, fix bool) error {
+	fmt.Printf("  Open henri's ports in %s:\n\n", fw.Name)
+	for _, c := range fw.OpenCmds {
+		fmt.Printf("      %s\n", commandLine(c, fw.NeedsRoot))
+	}
+	fmt.Println()
+
+	if !fix {
+		fmt.Printf("Run `henri doctor -fix` to have henri run those for you.\n")
+		return nil
+	}
+	ok, err := confirm("Run them now?")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		fmt.Println("Left the firewall alone.")
+		return nil
+	}
+	for _, c := range fw.OpenCmds {
+		line := commandLine(c, fw.NeedsRoot)
+		fmt.Printf("  %s\n", line)
+		name, rest := c[0], c[1:]
+		if fw.NeedsRoot && os.Geteuid() != 0 {
+			name, rest = "sudo", c
+		}
+		cmd := exec.Command(name, rest...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("%s: %w", line, err)
+		}
+	}
+	fmt.Printf("\nOpened. Run `henri doctor` again to confirm, and on the other device too.\n")
+	return nil
+}
+
+// commandLine renders a command the way the user would have to type it.
+func commandLine(argv []string, needsRoot bool) string {
+	quoted := make([]string, len(argv))
+	for i, a := range argv {
+		if strings.ContainsAny(a, " \t\"'") {
+			a = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+		}
+		quoted[i] = a
+	}
+	line := strings.Join(quoted, " ")
+	if needsRoot && os.Geteuid() != 0 {
+		return "sudo " + line
+	}
+	return line
+}
+
 // --- peers -----------------------------------------------------------------
 
 func cmdPeers(args []string) error {
@@ -1154,6 +1362,23 @@ func cmdServiceInstall(mgr service.Manager, force bool) error {
 	fmt.Printf("  henri service logs    follow its output\n")
 	fmt.Printf("  henri service uninstall\n\n")
 	fmt.Printf("The service points at that exact binary — reinstall if you move it.\n")
+
+	// Say this here rather than leaving it to be discovered. A closed inbound
+	// port does not stop henri starting, and it does not stop this device
+	// announcing itself or pushing its own clipboard out -- so both machines
+	// list each other as peers and sync runs in one direction only, which reads
+	// as henri being broken. It is the last thing standing between a fresh
+	// install and a working one, and the only one henri cannot see by itself.
+	fw := firewall.Detect(cfg.ListenPort, cfg.DiscoveryPort, firewall.LocalNetwork())
+	if fw.Blocking() {
+		fmt.Printf("\n⚠  %s is running here, and henri needs two ports open to receive:\n", fw.Name)
+		fmt.Printf("   tcp/%d for clipboard contents, udp/%d for finding devices.\n\n", cfg.ListenPort, cfg.DiscoveryPort)
+		if len(fw.OpenCmds) > 0 {
+			fmt.Printf("   Open them with:  henri doctor -fix\n\n")
+		}
+		fmt.Printf("   Without that, this device can still send, so the other machine will\n")
+		fmt.Printf("   see it and sync will work in one direction only.\n")
+	}
 	return nil
 }
 
