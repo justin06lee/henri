@@ -518,6 +518,14 @@ func cmdDaemon(args []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	// The tamper check on group_id and key exists only when there is a phrase
+	// to re-derive them from. A config without one -- made by an old henri, or
+	// stripped of the field by whoever swapped the key -- runs unverified, and
+	// that should at least be said out loud.
+	if cfg.Phrase == "" {
+		log.Warn("config has no recovery phrase; henri cannot verify that its group and key still belong together")
+	}
+
 	n, err := node.New(cfg, log)
 	if err != nil {
 		return err
@@ -745,6 +753,17 @@ func cmdDoctor(args []string) error {
 	fmt.Printf("  group      %s\n\n", safe(cfg.GroupID, maxName))
 
 	var problems []string
+
+	// The tamper check on group_id and key exists only when there is a phrase
+	// to re-derive them from; without one the config runs unverified, and the
+	// place to say so is the command whose whole job is saying what is wrong.
+	if cfg.Phrase == "" {
+		fmt.Printf("  ⚠ config     has no recovery phrase, so henri cannot check that its group\n")
+		fmt.Printf("               and key still belong together\n")
+		problems = append(problems, "This config predates recovery phrases, or the phrase was removed. To\n"+
+			"     move the group to a phrase, run `henri init` on one device and\n"+
+			"     `henri join` on the others.")
+	}
 
 	// The clipboard first: without it nothing else matters, and it is the one
 	// piece that fails differently under a service than it does in a terminal.
