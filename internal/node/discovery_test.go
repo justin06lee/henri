@@ -204,3 +204,50 @@ func TestBeaconClaimsNothingWhenTheSourceIsUnknown(t *testing.T) {
 		t.Fatalf("the beacon claims %q from an unspecified source", msg.Addr)
 	}
 }
+
+// A captured beacon replayed later must not reset the deafness timer: hearing
+// only replays is not hearing the group, and counting them kept the re-join
+// safety net from ever firing on a device that had actually gone deaf.
+func TestStaleBeaconDoesNotCountAsHearing(t *testing.T) {
+	n := offlineNode(t, "alpha")
+	n.deafWarned.Store(true)
+
+	plain, err := json.Marshal(&Message{
+		V: ProtocolVersion, Kind: KindHello, Device: "beta-id", Name: "beta",
+		TS: time.Now().Add(-time.Hour).UnixMilli(), Port: 47600, Addr: "192.168.1.9",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := n.disco.Seal(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n.handleBeacon(sealed, &net.UDPAddr{IP: net.ParseIP("192.168.1.9"), Port: 47601})
+	if n.heard.Load() != 0 {
+		t.Fatal("a stale beacon reset the deafness timer")
+	}
+	if !n.deafWarned.Load() {
+		t.Fatal("a stale beacon cleared the deaf warning")
+	}
+	if got := n.peers.addrs(); len(got) != 0 {
+		t.Fatalf("a stale beacon was accepted as a peer: %v", got)
+	}
+}
+
+// A fresh one still counts -- including this device's own echo, which is what
+// keeps a device alone on the network from declaring itself deaf.
+func TestOwnFreshBeaconStillCountsAsHearing(t *testing.T) {
+	n := offlineNode(t, "alpha")
+	n.deafWarned.Store(true)
+
+	own := sealBeacon(t, n, n.cfg.DeviceID, "alpha", 47600, "192.168.1.5")
+	n.handleBeacon(own, &net.UDPAddr{IP: net.ParseIP("192.168.1.5"), Port: 47601})
+	if n.heard.Load() == 0 {
+		t.Fatal("this device's own fresh beacon did not count as hearing")
+	}
+	if n.deafWarned.Load() {
+		t.Fatal("a fresh beacon did not clear the deaf warning")
+	}
+}
