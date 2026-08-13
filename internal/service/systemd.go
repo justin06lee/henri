@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,15 @@ func (s *systemd) Name() string     { return "systemd" }
 func (s *systemd) UnitPath() string { return s.unit }
 
 func (s *systemd) Install(binary string) error {
+	// Under sudo, HOME and XDG_CONFIG_HOME are root's, so the unit lands in
+	// /root/.config and is enabled against root's user manager -- a session
+	// with no display and no clipboard, while the user's own stays empty.
+	// launchd has refused this from the start; systemd just failed later and
+	// more confusingly.
+	if os.Getuid() == 0 {
+		return errors.New("service: run `henri service install` as yourself, not with sudo: a systemd user unit belongs to your own login session")
+	}
+
 	unit, err := s.render(binary)
 	if err != nil {
 		return err
