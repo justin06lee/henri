@@ -27,6 +27,12 @@ const (
 	DefaultPollMillis    = 400
 	DefaultMaxBytes      = 4 << 20 // 4 MiB
 
+	// DefaultMaxFileBytes caps a files-or-image payload; text has its own
+	// smaller cap above. MaxFileCeiling is as large as the protocol's 64 MiB
+	// frame can carry once JSON's base64 has taken its third.
+	DefaultMaxFileBytes = 32 << 20
+	MaxFileCeiling      = 45 << 20
+
 	// DefaultEntropyBits is the strength of a new group's recovery phrase.
 	// 160 bits is fifteen words. BIP-39 phrase lengths are always a multiple of
 	// three -- each word carries 11 bits and the checksum is a 32nd of the
@@ -65,6 +71,13 @@ type Config struct {
 	// one; set it if an event source misbehaves on your desktop.
 	PollOnly bool `json:"clipboard_poll_only,omitempty"`
 	MaxBytes int  `json:"max_payload_bytes"`
+	// MaxFileBytes caps a copied file, folder or image; anything larger is
+	// skipped with a warning rather than sent. It is bounded above by what a
+	// single protocol frame can carry.
+	MaxFileBytes int `json:"max_file_bytes"`
+	// ReceiveDir is where files copied on other devices are unpacked. Empty
+	// means ~/Downloads/henri, created on first use.
+	ReceiveDir string `json:"receive_dir,omitempty"`
 
 	// HideMenuBarIcon turns off the icon the daemon shows in the macOS menu
 	// bar while it runs. Phrased as an opt-out so the default is the good one;
@@ -146,9 +159,10 @@ func fromEntropy(phrase string, entropy []byte, deviceName string) (*Config, err
 		Discovery:     true,
 		// An empty list rather than nil, so a fresh config file says
 		// "peers": [] the way the documentation does, instead of "peers": null.
-		Peers:      []string{},
-		PollMillis: DefaultPollMillis,
-		MaxBytes:   DefaultMaxBytes,
+		Peers:        []string{},
+		PollMillis:   DefaultPollMillis,
+		MaxBytes:     DefaultMaxBytes,
+		MaxFileBytes: DefaultMaxFileBytes,
 	}, nil
 }
 
@@ -201,6 +215,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxBytes <= 0 {
 		c.MaxBytes = DefaultMaxBytes
+	}
+	if c.MaxFileBytes <= 0 {
+		c.MaxFileBytes = DefaultMaxFileBytes
 	}
 	if c.DeviceName == "" {
 		c.DeviceName, _ = os.Hostname()
@@ -255,7 +272,29 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: max_payload_bytes must be at least 1, got %d "+
 			"(a limit of zero silently refuses every copy)", c.MaxBytes)
 	}
+	if c.MaxFileBytes <= 0 {
+		return fmt.Errorf("config: max_file_bytes must be at least 1, got %d "+
+			"(a limit of zero silently refuses every file)", c.MaxFileBytes)
+	}
+	if c.MaxFileBytes > MaxFileCeiling {
+		return fmt.Errorf("config: max_file_bytes is %d, but a single frame can carry at most %d "+
+			"once encoding overhead is paid; files bigger than that want a syncthing, not a clipboard",
+			c.MaxFileBytes, MaxFileCeiling)
+	}
 	return c.checkPhrase()
+}
+
+// ReceivePath is where incoming files land: receive_dir, or ~/Downloads/henri
+// when unset. The directory itself is created by whoever writes into it.
+func (c *Config) ReceivePath() (string, error) {
+	if c.ReceiveDir != "" {
+		return c.ReceiveDir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("config: no home directory to receive files into: %w", err)
+	}
+	return filepath.Join(home, "Downloads", "henri"), nil
 }
 
 // checkPort rejects a number that is not a port. Zero is included: an absent
