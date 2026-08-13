@@ -1,6 +1,7 @@
 package firewall
 
 import (
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -172,5 +173,94 @@ func TestDetectDoesNotInventAFirewall(t *testing.T) {
 	}
 	if !st.Active && len(st.OpenCmds) > 0 {
 		t.Errorf("inactive firewall should need no commands: %+v", st)
+	}
+}
+
+// stubTools replaces the command runners for one test, feeding the detectors
+// exactly what the real tools print.
+func stubTools(t *testing.T, outputs map[string]string, errs map[string]error) {
+	t.Helper()
+	oldRun, oldHave := run, have
+	t.Cleanup(func() { run, have = oldRun, oldHave })
+	have = func(string) bool { return true }
+	run = func(name string, args ...string) (string, error) {
+		key := strings.Join(append([]string{name}, args...), " ")
+		out, ok := outputs[key]
+		if !ok {
+			t.Fatalf("unexpected command: %s", key)
+		}
+		return out, errs[key]
+	}
+}
+
+// A stopped firewalld says "not running", which contains "running". For a
+// while that read as an active firewall with unreadable rules, and Detect
+// stopped there instead of moving on to the firewall actually filtering.
+func TestStoppedFirewalldIsNotActive(t *testing.T) {
+	stubTools(t,
+		map[string]string{"firewall-cmd --state": "not running"},
+		map[string]error{"firewall-cmd --state": errors.New("exit status 252")})
+	st, ok := detectFirewalld(47600, 47601, "")
+	if !ok {
+		t.Fatal("firewalld was not recognised at all")
+	}
+	if st.Active {
+		t.Fatalf("a stopped firewalld reported itself active: %+v", st)
+	}
+}
+
+func TestRunningFirewalldReadsItsRules(t *testing.T) {
+	stubTools(t, map[string]string{
+		"firewall-cmd --state":           "running",
+		"firewall-cmd --list-ports":      "47600/tcp 47601/udp",
+		"firewall-cmd --list-rich-rules": "",
+	}, nil)
+	st, _ := detectFirewalld(47600, 47601, "")
+	if !st.Active || st.TCP != Allowed || st.UDP != Allowed {
+		t.Fatalf("a running firewalld with both ports open read as %+v", st)
+	}
+}
+
+func TestSaysRunningMatchesWholeLines(t *testing.T) {
+	cases := []struct {
+		out  string
+		want bool
+	}{
+		{"running", true},
+		{"not running", false},
+		{"WARNING: ALLOW_ZONE_DRIFTING is deprecated\nrunning", true},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := saysRunning(tc.out); got != tc.want {
+			t.Errorf("saysRunning(%q) = %v, want %v", tc.out, got, tc.want)
+		}
+	}
+}
+
+// "Block all incoming connections" reports State = 2, not State = 1. Treating
+// that as "firewall off" reported all clear in exactly the one macOS state
+// that stops henri receiving anything.
+func TestMacOSBlockAllIsReported(t *testing.T) {
+	stubTools(t, map[string]string{
+		"/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate": "Firewall is enabled. (State = 2)",
+	}, nil)
+	st := detectMacOS()
+	if !st.Active {
+		t.Fatalf("block-all read as an inactive firewall: %+v", st)
+	}
+	if st.TCP != Blocked || st.UDP != Blocked {
+		t.Fatalf("block-all did not report the ports blocked: %+v", st)
+	}
+}
+
+func TestMacOSEnabledWithoutBlockAllIsOpen(t *testing.T) {
+	stubTools(t, map[string]string{
+		"/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate": "Firewall is enabled. (State = 1)",
+		"/usr/libexec/ApplicationFirewall/socketfilterfw --getblockall":    "Firewall has block all state set to disabled.",
+	}, nil)
+	st := detectMacOS()
+	if !st.Active || st.TCP != Allowed || st.UDP != Allowed {
+		t.Fatalf("an enabled firewall without block-all read as %+v", st)
 	}
 }
