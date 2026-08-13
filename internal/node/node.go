@@ -50,6 +50,11 @@ var (
 	pendingFor   = 2 * time.Minute
 )
 
+// contentEcho is how long a files payload's content identity suppresses the
+// same content going around again. Long enough to outlive any echo loop,
+// short enough that deliberately re-copying the same files works again soon.
+const contentEcho = 30 * time.Second
+
 // Node is a running henri daemon.
 type Node struct {
 	cfg    *config.Config
@@ -92,6 +97,12 @@ type Node struct {
 	// skippedHash is content too large to sync. Kept apart from lastHash so
 	// `henri status` does not describe one payload with another's size.
 	skippedHash string
+	// seenContent remembers the content identity of file payloads recently
+	// sent or applied. Text and images echo-suppress by byte equality; a file
+	// trip renames and re-homes everything, so identity has to be carried by
+	// the contents. Without this, two daemons sharing one clipboard bounce a
+	// file copy back and forth forever, unpacking it again on every lap.
+	seenContent map[string]time.Time
 	clipErr     string // why the last clipboard read failed, if it did
 	watchMode   string // how changes are noticed: an event source, or polling
 
@@ -149,15 +160,16 @@ func NewWith(cfg *config.Config, log *slog.Logger, clip Clipboard) (*Node, error
 		return nil, err
 	}
 	n := &Node{
-		cfg:       cfg,
-		sync:      syncBox,
-		disco:     discoBox,
-		peers:     newPeerSet(cfg.Peers),
-		clip:      clip,
-		log:       log,
-		replay:    newReplayCache(maxReplay),
-		sem:       make(chan struct{}, maxHandlers),
-		startedAt: time.Now(),
+		cfg:         cfg,
+		sync:        syncBox,
+		disco:       discoBox,
+		peers:       newPeerSet(cfg.Peers),
+		clip:        clip,
+		log:         log,
+		replay:      newReplayCache(maxReplay),
+		sem:         make(chan struct{}, maxHandlers),
+		startedAt:   time.Now(),
+		seenContent: map[string]time.Time{},
 	}
 	if dir, err := cfg.ReceivePath(); err == nil {
 		n.receiveDir = dir
@@ -376,12 +388,45 @@ func (n *Node) fingerprint(snap clipboard.Snapshot) (fp string, size int, err er
 	}
 }
 
+// contentSeen reports whether this file content has been sent or applied
+// within the echo window. It never records; rememberContent does that, and
+// only after the send or the apply actually happened -- recording on a failed
+// attempt would suppress its own retry.
+func (n *Node) contentSeen(content string) bool {
+	if content == "" {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	at, ok := n.seenContent[content]
+	return ok && time.Since(at) < contentEcho
+}
+
+// rememberContent records that this file content just travelled.
+func (n *Node) rememberContent(content string) {
+	if content == "" {
+		return
+	}
+	now := time.Now()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.seenContent) > 64 {
+		for k, at := range n.seenContent {
+			if now.Sub(at) >= contentEcho {
+				delete(n.seenContent, k)
+			}
+		}
+	}
+	n.seenContent[content] = now
+}
+
 // payload is one clipboard's worth of content on its way to the group.
 type payload struct {
-	format string   // FormatText, FormatFiles or FormatImage
-	data   []byte   // the text, the archive, or the PNG
-	names  []string // FormatFiles: the archive's top-level names
-	fp     string   // the local fingerprint claimed when the push lands
+	format  string   // FormatText, FormatFiles or FormatImage
+	data    []byte   // the text, the archive, or the PNG
+	names   []string // FormatFiles: the archive's top-level names
+	fp      string   // the local fingerprint claimed when the push lands
+	content string   // FormatFiles: the name-independent content identity
 }
 
 // build turns a snapshot into what actually travels. For files that means
@@ -390,11 +435,11 @@ type payload struct {
 func (n *Node) build(snap clipboard.Snapshot, fp string) (payload, error) {
 	switch snap.Kind {
 	case clipboard.ContentFiles:
-		data, names, err := pack.Build(snap.Paths, n.cfg.MaxFileBytes)
+		data, names, content, err := pack.Build(snap.Paths, n.cfg.MaxFileBytes)
 		if err != nil {
 			return payload{}, err
 		}
-		return payload{format: FormatFiles, data: data, names: names, fp: fp}, nil
+		return payload{format: FormatFiles, data: data, names: names, fp: fp, content: content}, nil
 	case clipboard.ContentImage:
 		return payload{format: FormatImage, data: snap.Image, fp: fp}, nil
 	default:
@@ -493,6 +538,23 @@ func (n *Node) checkClipboard(ctx context.Context) {
 	n.clipMu.Unlock()
 
 	p, err := n.build(snap, fp)
+	if err == nil && p.format == FormatFiles && n.contentSeen(p.content) {
+		// These are the very files that just went around -- unpacked here or
+		// on another daemon watching this same clipboard -- wearing new paths.
+		// Claim them as synced and stay quiet, or two daemons on one machine
+		// lob the copy back and forth forever.
+		n.mu.Lock()
+		if n.lastHash == prev {
+			n.lastHash, n.lastBytes, n.lastFrom, n.lastSync = fp, size, "local", now
+			n.lastFormat, n.lastCount = p.format, len(p.names)
+		}
+		if n.pendingHash == fp {
+			n.pendingHash = ""
+		}
+		n.mu.Unlock()
+		n.log.Debug("files match content synced moments ago; not sending them again")
+		return
+	}
 	if err != nil {
 		// Archiving said no -- the files grew past the limit, vanished, or
 		// cannot be read. Warn once per copy rather than once per tick.
@@ -516,6 +578,7 @@ func (n *Node) checkClipboard(ctx context.Context) {
 		}
 		return
 	}
+	n.rememberContent(p.content)
 
 	n.mu.Lock()
 	// Something may have written the clipboard while the push was in flight.
@@ -853,9 +916,19 @@ func (n *Node) applyFiles(msg *Message) error {
 	}
 	// Unpacking happens before any lock: it is disk work, and the clipboard
 	// has no business waiting on it.
-	created, err := pack.Extract(msg.Data, n.receiveDir, n.cfg.MaxFileBytes)
+	created, content, err := pack.Extract(msg.Data, n.receiveDir, n.cfg.MaxFileBytes)
 	if err != nil {
 		return err
+	}
+	if n.contentSeen(content) {
+		// The same files came around again under new names -- an echo, not a
+		// copy. Acknowledge so the sender stops, and take the duplicates back
+		// off the disk.
+		for _, p := range created {
+			os.RemoveAll(p)
+		}
+		n.log.Debug("files match content synced moments ago; not applying them again")
+		return nil
 	}
 	// The claim is the fingerprint of what the watcher will see here: the
 	// unpacked paths, not the sender's. It has to be computed the same way.
@@ -869,6 +942,7 @@ func (n *Node) applyFiles(msg *Message) error {
 		// and picking them up there beats downloading them again.
 		return fmt.Errorf("%d files landed in %s, but the clipboard write failed: %w", len(created), n.receiveDir, err)
 	}
+	n.rememberContent(content)
 	return nil
 }
 
@@ -993,8 +1067,12 @@ func (n *Node) pushRich(ctx context.Context, snap clipboard.Snapshot) (string, i
 	n.mu.Lock()
 	n.lastFormat, n.lastCount = p.format, len(p.names)
 	n.mu.Unlock()
-	if sent, tried := n.push(ctx, p); sent == 0 && tried == 0 {
+	sent, tried := n.push(ctx, p)
+	if sent == 0 && tried == 0 {
 		n.log.Warn("sent, but no peer is known yet", "what", describe(p.format, len(p.names)))
+	}
+	if sent > 0 {
+		n.rememberContent(p.content)
 	}
 	return p.format, len(p.names), nil
 }

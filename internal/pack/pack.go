@@ -14,8 +14,12 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -23,6 +27,49 @@ import (
 	"sort"
 	"strings"
 )
+
+// contentSum fingerprints what the files say, not what they are called or
+// where they sit.
+//
+// Names change in transit -- a receiver renames collisions "name (2)" style --
+// so an archive's bytes never survive a round trip, and the byte-equality
+// that keeps text and images from echoing between devices does not exist for
+// files. This sum restores it: one digest per file over its contents and
+// size, combined order-independently, names excluded. The same files sum the
+// same however they have been renamed or reordered along the way.
+type contentSum struct {
+	digests []string
+}
+
+// file starts one file's digest; feed it the contents, then close it.
+func (c *contentSum) file() *fileDigest { return &fileDigest{h: sha256.New(), sum: c} }
+
+func (c *contentSum) sum() string {
+	sort.Strings(c.digests)
+	h := sha256.New()
+	for _, d := range c.digests {
+		h.Write([]byte(d))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+type fileDigest struct {
+	h   hash.Hash
+	n   int64
+	sum *contentSum
+}
+
+func (f *fileDigest) Write(p []byte) (int, error) {
+	f.n += int64(len(p))
+	return f.h.Write(p)
+}
+
+// close seals the file's contribution; the size keeps "ab","c" and "a","bc"
+// apart.
+func (f *fileDigest) close() {
+	_ = binary.Write(f.h, binary.BigEndian, f.n)
+	f.sum.digests = append(f.sum.digests, hex.EncodeToString(f.h.Sum(nil)))
+}
 
 // ErrTooBig means the files exceed the limit the caller set. It is a size
 // answer, not a failure: the caller decides whether to tell the user or skip.
@@ -35,9 +82,9 @@ var ErrTooBig = errors.New("pack: the files are larger than the limit")
 // Symlinks are skipped: a link's target is somewhere on the sending machine,
 // and shipping the link would dangle while shipping the target would surprise.
 // .DS_Store never deserves to travel.
-func Build(paths []string, limit int) (data []byte, names []string, err error) {
+func Build(paths []string, limit int) (data []byte, names []string, content string, err error) {
 	if len(paths) == 0 {
-		return nil, nil, errors.New("pack: nothing to archive")
+		return nil, nil, "", errors.New("pack: nothing to archive")
 	}
 
 	// Sizes first, so a folder full of video fails in milliseconds instead of
@@ -46,38 +93,39 @@ func Build(paths []string, limit int) (data []byte, names []string, err error) {
 	for _, p := range paths {
 		n, err := sizeOf(p)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		total += n
 		if total > int64(limit) {
-			return nil, nil, fmt.Errorf("%w (%d bytes so far, limit %d)", ErrTooBig, total, limit)
+			return nil, nil, "", fmt.Errorf("%w (%d bytes so far, limit %d)", ErrTooBig, total, limit)
 		}
 	}
 
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
+	cs := &contentSum{}
 	seen := map[string]bool{}
 	for _, p := range paths {
 		top := uniqueName(filepath.Base(p), func(name string) bool { return seen[name] })
 		seen[top] = true
-		if err := addPath(tw, p, top); err != nil {
-			return nil, nil, err
+		if err := addPath(tw, p, top, cs); err != nil {
+			return nil, nil, "", err
 		}
 		names = append(names, top)
 	}
 	if err := tw.Close(); err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 	if err := gz.Close(); err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 	// tar rounds up in 512-byte blocks, so a limit-sized file of incompressible
 	// bytes can end up a shade over. The wire cap is on the payload; hold it.
 	if buf.Len() > limit {
-		return nil, nil, fmt.Errorf("%w (%d bytes archived, limit %d)", ErrTooBig, buf.Len(), limit)
+		return nil, nil, "", fmt.Errorf("%w (%d bytes archived, limit %d)", ErrTooBig, buf.Len(), limit)
 	}
-	return buf.Bytes(), names, nil
+	return buf.Bytes(), names, cs.sum(), nil
 }
 
 // sizeOf is the recursive size of one path, skipping what Build skips.
@@ -116,7 +164,7 @@ func sizeOf(path string) (int64, error) {
 }
 
 // addPath writes one top-level file or directory into the archive as top.
-func addPath(tw *tar.Writer, path, top string) error {
+func addPath(tw *tar.Writer, path, top string, cs *contentSum) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
@@ -125,7 +173,7 @@ func addPath(tw *tar.Writer, path, top string) error {
 		return nil
 	}
 	if !info.IsDir() {
-		return addFile(tw, path, top, info)
+		return addFile(tw, path, top, info, cs)
 	}
 	return filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -155,11 +203,11 @@ func addPath(tw *tar.Writer, path, top string) error {
 		if !d.Type().IsRegular() {
 			return nil // sockets, pipes, devices: nothing a clipboard should carry
 		}
-		return addFile(tw, p, name, fi)
+		return addFile(tw, p, name, fi, cs)
 	})
 }
 
-func addFile(tw *tar.Writer, path, name string, info fs.FileInfo) error {
+func addFile(tw *tar.Writer, path, name string, info fs.FileInfo, cs *contentSum) error {
 	if err := tw.WriteHeader(&tar.Header{
 		Name: name, Typeflag: tar.TypeReg, Size: info.Size(),
 		Mode: int64(info.Mode().Perm()), ModTime: info.ModTime(),
@@ -171,8 +219,12 @@ func addFile(tw *tar.Writer, path, name string, info fs.FileInfo) error {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(tw, f)
-	return err
+	fd := cs.file()
+	if _, err := io.Copy(io.MultiWriter(tw, fd), f); err != nil {
+		return err
+	}
+	fd.close()
+	return nil
 }
 
 // Extract unpacks an archive into dir and returns the top-level paths it
@@ -183,27 +235,28 @@ func addFile(tw *tar.Writer, path, name string, info fs.FileInfo) error {
 // limit caps the total unpacked bytes. The archive passed the wire's size
 // check compressed; without this, a small frame of well-chosen zeros unpacks
 // into anything at all.
-func Extract(data []byte, dir string, limit int) (created []string, err error) {
+func Extract(data []byte, dir string, limit int) (created []string, content string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	gz, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("pack: not a henri archive: %w", err)
+		return nil, "", fmt.Errorf("pack: not a henri archive: %w", err)
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	cs := &contentSum{}
 
 	// Top-level names in the archive are mapped to what they are actually
 	// called on disk, once, so a renamed folder carries its contents along.
 	renames := map[string]string{}
 	var tops []string
 	var total int64
-	fail := func(err error) ([]string, error) {
+	fail := func(err error) ([]string, string, error) {
 		for _, t := range tops {
 			os.RemoveAll(filepath.Join(dir, t))
 		}
-		return nil, err
+		return nil, "", err
 	}
 
 	for {
@@ -258,13 +311,15 @@ func Extract(data []byte, dir string, limit int) (created []string, err error) {
 			}
 			// LimitReader rather than trusting hdr.Size alone: the count above
 			// is the guard, this makes it unconditional.
-			if _, err := io.Copy(f, io.LimitReader(tr, hdr.Size)); err != nil {
+			fd := cs.file()
+			if _, err := io.Copy(io.MultiWriter(f, fd), io.LimitReader(tr, hdr.Size)); err != nil {
 				f.Close()
 				return fail(err)
 			}
 			if err := f.Close(); err != nil {
 				return fail(err)
 			}
+			fd.close()
 			_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
 		default:
 			// Symlinks, hard links, devices: skipped on the way in, and
@@ -284,7 +339,7 @@ func Extract(data []byte, dir string, limit int) (created []string, err error) {
 	if len(created) == 0 {
 		return fail(errors.New("pack: the archive contained nothing henri writes"))
 	}
-	return created, nil
+	return created, cs.sum(), nil
 }
 
 // splitTop splits an archive name into its top-level entry and the rest,

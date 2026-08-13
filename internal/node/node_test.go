@@ -1017,7 +1017,7 @@ func TestFilesArriveOverTheWireAsV2(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "wire.txt"), []byte("framed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	data, names, err := pack.Build([]string{filepath.Join(src, "wire.txt")}, 1<<20)
+	data, names, _, err := pack.Build([]string{filepath.Join(src, "wire.txt")}, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1045,5 +1045,72 @@ func TestTextTravelsAsV1(t *testing.T) {
 		if v := versionFor(f); v != ProtocolVersionRich {
 			t.Fatalf("%s travels as v%d, want v%d so old devices refuse it whole", f, v, ProtocolVersionRich)
 		}
+	}
+}
+
+// Two daemons sharing one clipboard -- the single-box testing setup the
+// README describes -- must not lob a file copy back and forth forever. Text
+// never had this problem because its bytes survive the trip; files come back
+// renamed and re-homed, so their identity has to be carried by their content.
+func TestTwoDaemonsOnOneClipboardDoNotStormOverFiles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+
+	// One clipboard, two nodes: startNode would make two, so build by hand.
+	shared := &fakeClipboard{}
+	mk := func(name string, port, peer int) *Node {
+		cfg := &config.Config{
+			GroupID: group, Key: key, DeviceID: name + "-id", DeviceName: name,
+			ListenPort: port, PollMillis: 20, MaxBytes: 1 << 20, MaxFileBytes: 1 << 20,
+			Peers:      []string{fmt.Sprintf("127.0.0.1:%d", peer)},
+			ReceiveDir: t.TempDir(),
+		}
+		n, err := NewWith(cfg, quietLogger(), shared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- n.Run(ctx) }()
+		t.Cleanup(func() {
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Log("node did not shut down in time")
+			}
+		})
+		waitForPort(t, port)
+		return n
+	}
+	a := mk("alpha", portA, portB)
+	b := mk("beta", portB, portA)
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "travel.txt"), []byte("once only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shared.setFiles([]string{filepath.Join(src, "travel.txt")})
+
+	// Let it settle. Without the content guard this window produces a dozen
+	// laps and a receive dir full of "travel (2) (2) (2).txt".
+	time.Sleep(1200 * time.Millisecond)
+
+	for name, n := range map[string]*Node{"alpha": a, "beta": b} {
+		entries, err := os.ReadDir(n.receiveDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) > 1 {
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Fatalf("%s's receive dir filled with duplicates: %v", name, names)
+		}
+	}
+	if total := a.sent.Load() + b.sent.Load(); total > 3 {
+		t.Fatalf("the copy went around %d times; the content guard is not holding", total)
 	}
 }

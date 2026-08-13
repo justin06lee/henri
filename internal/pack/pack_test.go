@@ -27,7 +27,7 @@ func TestFilesAndFoldersRoundTrip(t *testing.T) {
 	write(t, filepath.Join(src, "album", "one.txt"), "track one")
 	write(t, filepath.Join(src, "album", "deep", "two.txt"), "track two")
 
-	data, names, err := Build([]string{
+	data, names, _, err := Build([]string{
 		filepath.Join(src, "note.txt"),
 		filepath.Join(src, "album"),
 	}, 1<<20)
@@ -38,7 +38,7 @@ func TestFilesAndFoldersRoundTrip(t *testing.T) {
 		t.Fatalf("names = %v", names)
 	}
 
-	created, err := Extract(data, dst, 1<<20)
+	created, _, err := Extract(data, dst, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,14 +63,14 @@ func TestSameNamedSourcesAreBothKept(t *testing.T) {
 	write(t, filepath.Join(a, "x.txt"), "from a")
 	write(t, filepath.Join(b, "x.txt"), "from b")
 
-	data, names, err := Build([]string{filepath.Join(a, "x.txt"), filepath.Join(b, "x.txt")}, 1<<20)
+	data, names, _, err := Build([]string{filepath.Join(a, "x.txt"), filepath.Join(b, "x.txt")}, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if names[0] != "x.txt" || names[1] != "x (2).txt" {
 		t.Fatalf("names = %v", names)
 	}
-	if _, err := Extract(data, dst, 1<<20); err != nil {
+	if _, _, err := Extract(data, dst, 1<<20); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := os.ReadFile(filepath.Join(dst, "x (2).txt"))
@@ -85,11 +85,11 @@ func TestExtractionNeverOverwrites(t *testing.T) {
 	write(t, filepath.Join(src, "report.pdf"), "new arrival")
 	write(t, filepath.Join(dst, "report.pdf"), "already here")
 
-	data, _, err := Build([]string{filepath.Join(src, "report.pdf")}, 1<<20)
+	data, _, _, err := Build([]string{filepath.Join(src, "report.pdf")}, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := Extract(data, dst, 1<<20)
+	created, _, err := Extract(data, dst, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestExtractionNeverOverwrites(t *testing.T) {
 func TestBuildRefusesTooMuchWithoutArchivingIt(t *testing.T) {
 	src := t.TempDir()
 	write(t, filepath.Join(src, "big"), strings.Repeat("x", 4096))
-	_, _, err := Build([]string{filepath.Join(src, "big")}, 1024)
+	_, _, _, err := Build([]string{filepath.Join(src, "big")}, 1024)
 	if !errors.Is(err, ErrTooBig) {
 		t.Fatalf("err = %v, want ErrTooBig", err)
 	}
@@ -118,11 +118,11 @@ func TestSymlinksAndDSStoreStayHome(t *testing.T) {
 		t.Skip("no symlinks here")
 	}
 
-	data, _, err := Build([]string{filepath.Join(src, "folder")}, 1<<20)
+	data, _, _, err := Build([]string{filepath.Join(src, "folder")}, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Extract(data, dst, 1<<20); err != nil {
+	if _, _, err := Extract(data, dst, 1<<20); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{".DS_Store", "link"} {
@@ -159,7 +159,7 @@ func TestHostileNamesAreRefused(t *testing.T) {
 		"/etc/cron.d/henri",
 		"..",
 	} {
-		_, err := Extract(hostileArchive(t, map[string]string{name: "gotcha"}), dst, 1<<20)
+		_, _, err := Extract(hostileArchive(t, map[string]string{name: "gotcha"}), dst, 1<<20)
 		if err == nil {
 			t.Fatalf("an archive naming %q was extracted", name)
 		}
@@ -182,7 +182,7 @@ func TestSymlinkEntriesAreSkippedOnExtract(t *testing.T) {
 	tw.Close()
 	gz.Close()
 
-	created, err := Extract(buf.Bytes(), dst, 1<<20)
+	created, _, err := Extract(buf.Bytes(), dst, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestDecompressionIsCapped(t *testing.T) {
 	if len(bomb) > 8*1024 {
 		t.Fatalf("the bomb did not compress (%d bytes); the test is not testing anything", len(bomb))
 	}
-	_, err := Extract(bomb, dst, 64*1024)
+	_, _, err := Extract(bomb, dst, 64*1024)
 	if !errors.Is(err, ErrTooBig) {
 		t.Fatalf("err = %v, want ErrTooBig", err)
 	}
@@ -222,7 +222,7 @@ func TestSetuidDoesNotSurvive(t *testing.T) {
 	_, _ = tw.Write([]byte("hi"))
 	tw.Close()
 	gz.Close()
-	if _, err := Extract(buf.Bytes(), dst, 1<<20); err != nil {
+	if _, _, err := Extract(buf.Bytes(), dst, 1<<20); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(filepath.Join(dst, "tool"))
@@ -231,5 +231,45 @@ func TestSetuidDoesNotSurvive(t *testing.T) {
 	}
 	if info.Mode()&os.ModeSetuid != 0 {
 		t.Fatal("setuid survived extraction")
+	}
+}
+
+// The content sum is the identity that survives a round trip: renames and
+// reorders must not change it, contents must.
+func TestContentSumSurvivesRenamesAndReorders(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	write(t, filepath.Join(src, "a.txt"), "alpha")
+	write(t, filepath.Join(src, "b.txt"), "beta")
+
+	_, _, original, err := Build([]string{filepath.Join(src, "a.txt"), filepath.Join(src, "b.txt")}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _, _, err := Build([]string{filepath.Join(src, "b.txt"), filepath.Join(src, "a.txt")}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, reordered, _ := Build([]string{filepath.Join(src, "b.txt"), filepath.Join(src, "a.txt")}, 1<<20); reordered != original {
+		t.Fatal("reordering the sources changed the content sum")
+	}
+
+	// Extract renames nothing here, but the receive side must agree with the
+	// send side byte for byte.
+	created, extracted, err := Extract(data, dst, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if extracted != original {
+		t.Fatal("extraction disagrees with the build about the content sum")
+	}
+	// And re-packing the extracted files -- new dir, possibly new names --
+	// still sums the same. This is the loop-breaker.
+	if _, _, repacked, _ := Build(created, 1<<20); repacked != original {
+		t.Fatal("re-packing the received files changed the content sum")
+	}
+
+	write(t, filepath.Join(src, "a.txt"), "alpha edited")
+	if _, _, edited, _ := Build([]string{filepath.Join(src, "a.txt"), filepath.Join(src, "b.txt")}, 1<<20); edited == original {
+		t.Fatal("editing a file did not change the content sum")
 	}
 }
