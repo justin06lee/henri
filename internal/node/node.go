@@ -718,6 +718,8 @@ func (n *Node) pushCurrent(ctx context.Context, primary bool) error {
 
 	h := secure.Hash(data)
 	n.mu.Lock()
+	prevHash, prevBytes, prevFrom, prevSync := n.lastHash, n.lastBytes, n.lastFrom, n.lastSync
+	prevPending, prevPendingSince, prevPendingTried, prevPendingWait := n.pendingHash, n.pendingSince, n.pendingTried, n.pendingWait
 	n.lastHash, n.lastBytes = h, len(data)
 	n.lastFrom, n.lastSync = "local", time.Now()
 	n.pendingHash = ""
@@ -727,8 +729,18 @@ func (n *Node) pushCurrent(ctx context.Context, primary bool) error {
 	// copy and send it twice.
 	if primary {
 		if err := n.clip.Write(data); err != nil {
+			// Put the old fingerprint back, exactly as applyClip does. Without
+			// this the daemon believed it held the highlighted text while the
+			// clipboard still held the old content -- and the next watch tick
+			// read that old content, saw an unknown hash, and re-broadcast it
+			// to the group as a fresh copy.
+			n.mu.Lock()
+			n.lastHash, n.lastBytes = prevHash, prevBytes
+			n.lastFrom, n.lastSync = prevFrom, prevSync
+			n.pendingHash, n.pendingSince, n.pendingTried, n.pendingWait = prevPending, prevPendingSince, prevPendingTried, prevPendingWait
+			n.mu.Unlock()
 			n.clipMu.Unlock()
-			return fmt.Errorf("copied to the group but not to this device's clipboard: %w", err)
+			return fmt.Errorf("could not copy to this device's clipboard, so nothing was sent: %w", err)
 		}
 	}
 	n.clipMu.Unlock()

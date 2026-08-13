@@ -782,3 +782,38 @@ func TestCopyMadeBeforeAnyPeerIsKnownIsNotLost(t *testing.T) {
 		return clipB.get() == "copied while alone"
 	})
 }
+
+// A failed local write must not leave the daemon believing the clipboard holds
+// the highlighted text. It did: pushCurrent claimed the new hash, the write
+// failed, and the next watch tick read the old content still on the clipboard,
+// saw an unknown hash, and re-broadcast the old clipboard to the group --
+// undoing the very copy the key press was for.
+func TestFailedHighlightedCopyRollsTheFingerprintBack(t *testing.T) {
+	cfg := &config.Config{
+		GroupID: "test-group", Key: groupKey(t), DeviceID: "alpha-id", DeviceName: "alpha",
+		ListenPort: freePort(t), PollMillis: 20, MaxBytes: 1 << 20,
+	}
+	clip := &fakeClipboard{}
+	n, err := NewWith(cfg, quietLogger(), clip)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clip.set("old")
+	n.mu.Lock()
+	n.lastHash, n.lastBytes = secure.Hash([]byte("old")), len("old")
+	n.mu.Unlock()
+
+	clip.highlight("new")
+	clip.failWrites(errors.New("no display"))
+	if err := n.pushCurrent(context.Background(), true); err == nil {
+		t.Fatal("a failed clipboard write did not report an error")
+	}
+
+	n.mu.Lock()
+	got := n.lastHash
+	n.mu.Unlock()
+	if got != secure.Hash([]byte("old")) {
+		t.Fatal("the fingerprint was not rolled back; the watcher would re-broadcast the old clipboard")
+	}
+}
