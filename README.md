@@ -40,6 +40,9 @@ whole idea.
   gets its `\r\n` back when it lands on Windows.
 - **Starts at login.** `henri service install` sets it up as a launchd agent or
   a systemd user unit and gets out of the way.
+- **Shows its face.** On macOS, henri's icon sits in the menu bar for exactly
+  as long as the daemon runs — glance up to know sync is on. Its menu can push
+  the clipboard to the group; `"hide_menu_bar_icon": true` turns it off.
 - **One static binary, no dependencies.** Nothing outside the Go standard
   library, no cgo.
 
@@ -388,6 +391,7 @@ writes the file the link points at and leaves the link alone.
 | `poll_interval_ms` | `400` | How often the clipboard is checked, when no event source is available |
 | `clipboard_poll_only` | `false` | Ignore event sources and always poll |
 | `max_payload_bytes` | `4194304` | Clipboards larger than this are skipped |
+| `hide_menu_bar_icon` | `false` | Turn off the macOS menu bar icon |
 
 Devices that aren't on the same network — a VPS, or a laptop behind a different
 router — won't be found by multicast. Add them by address:
@@ -810,6 +814,10 @@ Found a problem? Open an issue.
 - **`henri service` is macOS and Linux only.** Windows syncs fine, but has no
   install-at-login integration yet; run `henri daemon` from a shortcut in
   `shell:startup` for now.
+- **The menu bar icon is macOS only.** A Linux tray is a protocol negotiation
+  with the desktop that no shipped helper performs, and Windows would need a
+  message pump henri does not have. `henri status` answers the same question
+  everywhere.
 
 ---
 
@@ -839,6 +847,7 @@ internal/node        the daemon: watcher, peers, discovery, protocol
 internal/service     launchd and systemd integration
 internal/hotkey      the send-highlighted key binding
 internal/firewall    firewall detection for `henri doctor`
+internal/tray        the macOS menu bar icon
 assets/              the panel image at the top of this README
 ```
 
@@ -848,7 +857,15 @@ assets/              the panel image at the top of this README
 
 Named after Henri from **Kindergarten WARS** — a manga by You Chiba, serialized
 on Shōnen Jump+ since 2022, about a kindergarten staffed by retired
-assassins. The image at the top is traced from a panel of him.
+assassins. The image at the top is traced from a panel of him, and the same
+panel sits in the macOS menu bar while henri runs.
+
+How it gets there is henri all over: a menu bar item needs AppKit, AppKit
+needs cgo, and henri does not take cgo — but macOS ships `osascript`, whose
+JavaScript-for-Automation bridge can drive AppKit from a plain process. The
+daemon spawns a small supervised script that draws the icon and takes itself
+down when the daemon dies, so the icon in the bar and "sync is running" are
+the same fact.
 
 No affiliation with the author or Shueisha. The artwork belongs to them — it's
 here because I like the manga.

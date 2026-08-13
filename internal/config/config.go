@@ -65,6 +65,11 @@ type Config struct {
 	// one; set it if an event source misbehaves on your desktop.
 	PollOnly bool `json:"clipboard_poll_only,omitempty"`
 	MaxBytes int  `json:"max_payload_bytes"`
+
+	// HideMenuBarIcon turns off the icon the daemon shows in the macOS menu
+	// bar while it runs. Phrased as an opt-out so the default is the good one;
+	// it does nothing anywhere else, where there is no icon to hide.
+	HideMenuBarIcon bool `json:"hide_menu_bar_icon,omitempty"`
 }
 
 // Path returns the config file location, honouring $HENRI_CONFIG and
