@@ -675,3 +675,21 @@ func legacyCodeFor(t *testing.T, port int) string {
 	}
 	return legacyCodePrefix + base64.RawURLEncoding.EncodeToString(raw)
 }
+
+func TestFormatNote(t *testing.T) {
+	cases := []struct {
+		format string
+		count  int
+		want   string
+	}{
+		{"", 0, ""},
+		{"files", 1, " (1 file)"},
+		{"files", 3, " (3 files)"},
+		{"image/png", 0, " (image)"},
+	}
+	for _, tc := range cases {
+		if got := formatNote(tc.format, tc.count); got != tc.want {
+			t.Errorf("formatNote(%q, %d) = %q, want %q", tc.format, tc.count, got, tc.want)
+		}
+	}
+}
