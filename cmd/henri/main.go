@@ -28,6 +28,7 @@ import (
 	"github.com/justin06lee/henri/internal/mnemonic"
 	"github.com/justin06lee/henri/internal/node"
 	"github.com/justin06lee/henri/internal/service"
+	"github.com/justin06lee/henri/internal/tray"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -533,6 +534,19 @@ func cmdDaemon(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The menu bar icon lives exactly as long as the daemon, which is what
+	// makes it worth glancing at. It is decoration: failing to draw it must
+	// never stop the sync it reports on.
+	if tray.Supported() && !cfg.HideMenuBarIcon {
+		bin, err := service.BinaryPath()
+		if err != nil {
+			bin = "henri"
+		}
+		if err := tray.Start(ctx, log, tray.Info{DeviceName: cfg.DeviceName, Binary: bin}); err != nil {
+			log.Warn("could not draw the menu bar icon", "err", err)
+		}
+	}
 
 	if err := n.Run(ctx); err != nil {
 		return err
