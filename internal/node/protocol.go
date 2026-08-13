@@ -14,7 +14,15 @@ import (
 )
 
 // ProtocolVersion is bumped on any incompatible wire change.
-const ProtocolVersion = 1
+//
+// Text still travels as v1 so groups with older devices keep syncing text.
+// Files and images travel as v2, which an old device refuses whole -- far
+// better than the alternative, an old device pasting a tar archive into a
+// document as if it were text.
+const (
+	ProtocolVersion     = 1
+	ProtocolVersionRich = 2
+)
 
 // Message kinds.
 const (
@@ -25,6 +33,22 @@ const (
 	KindAck    = "ack"    // generic success reply
 	KindState  = "state"  // reply to KindStatus
 )
+
+// Clip payload formats. Text is the empty string because that is what every
+// frame said before the field existed.
+const (
+	FormatText  = ""
+	FormatFiles = "files"     // Data is a gzip'd tar; Names are its top-level entries
+	FormatImage = "image/png" // Data is one PNG
+)
+
+// versionFor is the wire version a clip payload of this format travels as.
+func versionFor(format string) int {
+	if format == FormatText {
+		return ProtocolVersion
+	}
+	return ProtocolVersionRich
+}
 
 // maxFrame is the hard ceiling on a single TCP frame. Nothing henri sends comes
 // close to it; frameLimit is what an inbound frame is really held to.
@@ -70,6 +94,13 @@ type Message struct {
 	// Clip.
 	Hash string `json:"hash,omitempty"`
 	Data []byte `json:"data,omitempty"`
+	// Format says what Data is: text when empty, or one of the Format
+	// constants. Names are the file names inside a files payload, so the
+	// receiver can log and show what arrived without opening the archive.
+	// Count rides on a push ack so `henri send` can say how many went.
+	Format string   `json:"format,omitempty"`
+	Names  []string `json:"names,omitempty"`
+	Count  int      `json:"count,omitempty"`
 
 	// Replies.
 	State *State `json:"state,omitempty"`
@@ -98,8 +129,12 @@ type State struct {
 	LastHash  string `json:"last_hash"`
 	LastBytes int    `json:"last_bytes"`
 	LastFrom  string `json:"last_from"`
-	Sent      int64  `json:"sent"`
-	Received  int64  `json:"received"`
+	// LastFormat and LastCount say what the last sync was: text when empty,
+	// or a format constant, with LastCount the number of files it carried.
+	LastFormat string `json:"last_format,omitempty"`
+	LastCount  int    `json:"last_count,omitempty"`
+	Sent       int64  `json:"sent"`
+	Received   int64  `json:"received"`
 	// Beacons counts the discovery beacons heard from other devices, and
 	// LastBeaconAt is when the most recent one arrived. A daemon that has been
 	// up for hours with no beacons is deaf, however healthy it otherwise looks.
@@ -195,8 +230,8 @@ func readFrame(r io.Reader, box *secure.Box, limit int) (*Message, []byte, error
 	if err := json.Unmarshal(plain, &msg); err != nil {
 		return nil, nil, fmt.Errorf("henri: malformed message: %w", err)
 	}
-	if msg.V != ProtocolVersion {
-		return nil, nil, fmt.Errorf("henri: peer speaks protocol v%d, this build speaks v%d", msg.V, ProtocolVersion)
+	if msg.V != ProtocolVersion && msg.V != ProtocolVersionRich {
+		return nil, nil, fmt.Errorf("henri: peer speaks protocol v%d, this build speaks v%d", msg.V, ProtocolVersionRich)
 	}
 	// Open has already established the frame is at least a nonce and a tag.
 	return &msg, append([]byte(nil), sealed[:nonceSize]...), nil

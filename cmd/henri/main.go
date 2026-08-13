@@ -493,6 +493,7 @@ func joinLegacyCode(code, device string) (*config.Config, error) {
 		Peers:         []string{},
 		PollMillis:    config.DefaultPollMillis,
 		MaxBytes:      config.DefaultMaxBytes,
+		MaxFileBytes:  config.DefaultMaxFileBytes,
 	}, nil
 }
 
@@ -648,8 +649,9 @@ func cmdStatus(args []string) error {
 	fmt.Printf("  uptime     %s   pid %d\n", since(st.StartedAt), st.PID)
 	fmt.Printf("  traffic    %d sent · %d received\n", st.Sent, st.Received)
 	if st.LastSyncAt != 0 {
-		fmt.Printf("  last       %s from %s, %s ago\n",
-			humanBytes(st.LastBytes), safe(st.LastFrom, maxName), since(st.LastSyncAt))
+		fmt.Printf("  last       %s%s from %s, %s ago\n",
+			humanBytes(st.LastBytes), formatNote(st.LastFormat, st.LastCount),
+			safe(st.LastFrom, maxName), since(st.LastSyncAt))
 	} else {
 		fmt.Printf("  last       nothing synced yet\n")
 	}
@@ -1168,11 +1170,27 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := node.QueryPush(cfg, *highlighted); err != nil {
+	resp, err := node.QueryPush(cfg, *highlighted)
+	if err != nil {
 		if errors.Is(err, node.ErrNotRunning) {
 			return err
 		}
 		return daemonQueryError(cfg.ListenPort, err)
+	}
+	// The daemon says what actually went -- text, files, or an image -- so
+	// this can report the truth rather than guess from the flags.
+	switch resp.Format {
+	case "files":
+		if resp.Count == 1 {
+			fmt.Println("Sent the copied file to the group. It lands in each device's receive")
+		} else {
+			fmt.Printf("Sent the %d copied files to the group. They land in each device's receive\n", resp.Count)
+		}
+		fmt.Println("folder (~/Downloads/henri unless configured) and on its clipboard, ready to paste.")
+		return nil
+	case "image/png":
+		fmt.Println("Sent the image on the clipboard to the group.")
+		return nil
 	}
 	if !*highlighted {
 		fmt.Println("Sent the current clipboard to the group.")
@@ -1777,6 +1795,22 @@ func since(unixMilli int64) string {
 // payload limit of a pebibyte -- reachable by hand-editing max_payload_bytes --
 // crashed the command on an index out of range rather than printing a slightly
 // silly number.
+// formatNote qualifies a size with what the payload was, when it was not
+// text: "  (3 files)", " (image)". Text stays bare, as it always read.
+func formatNote(format string, count int) string {
+	switch format {
+	case "files":
+		if count == 1 {
+			return " (1 file)"
+		}
+		return fmt.Sprintf(" (%d files)", count)
+	case "image/png":
+		return " (image)"
+	default:
+		return ""
+	}
+}
+
 func humanBytes(n int) string {
 	const unit = 1024
 	if n < unit {

@@ -602,3 +602,58 @@ func TestDiscoveryPortIsOnlyRequiredWhenDiscoveryIsOn(t *testing.T) {
 		t.Fatal("discovery is on with no port to do it on, and that was accepted")
 	}
 }
+
+func TestFileLimitsAreDefaultedAndBounded(t *testing.T) {
+	withTempConfig(t)
+	cfg, err := New("box", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxFileBytes != DefaultMaxFileBytes {
+		t.Fatalf("a new config caps files at %d, want %d", cfg.MaxFileBytes, DefaultMaxFileBytes)
+	}
+
+	// An old config that has never heard of the field gets the default.
+	cfg.MaxFileBytes = 0
+	if err := cfg.Save(); err == nil {
+		t.Fatal("a zero max_file_bytes was saved")
+	}
+	cfg.MaxFileBytes = DefaultMaxFileBytes
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.MaxFileBytes != DefaultMaxFileBytes {
+		t.Fatalf("loaded max_file_bytes = %d", loaded.MaxFileBytes)
+	}
+
+	// The frame can only carry so much; a limit past it is refused with an
+	// explanation rather than obeyed and then refused frame by frame.
+	loaded.MaxFileBytes = MaxFileCeiling + 1
+	if err := loaded.Validate(); err == nil {
+		t.Fatal("a max_file_bytes past the frame ceiling validated")
+	}
+}
+
+func TestReceivePathDefaultsToDownloads(t *testing.T) {
+	withTempConfig(t)
+	cfg, err := New("box", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cfg.ReceivePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, _ := os.UserHomeDir()
+	if got != filepath.Join(home, "Downloads", "henri") {
+		t.Fatalf("default receive path = %q", got)
+	}
+	cfg.ReceiveDir = "/data/drops"
+	if got, _ := cfg.ReceivePath(); got != "/data/drops" {
+		t.Fatalf("explicit receive path = %q", got)
+	}
+}

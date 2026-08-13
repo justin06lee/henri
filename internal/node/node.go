@@ -15,8 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"strings"
+
 	"github.com/justin06lee/henri/internal/clipboard"
 	"github.com/justin06lee/henri/internal/config"
+	"github.com/justin06lee/henri/internal/pack"
 	"github.com/justin06lee/henri/internal/secure"
 )
 
@@ -47,6 +50,11 @@ var (
 	pendingFor   = 2 * time.Minute
 )
 
+// contentEcho is how long a files payload's content identity suppresses the
+// same content going around again. Long enough to outlive any echo loop,
+// short enough that deliberately re-copying the same files works again soon.
+const contentEcho = 30 * time.Second
+
 // Node is a running henri daemon.
 type Node struct {
 	cfg    *config.Config
@@ -68,11 +76,17 @@ type Node struct {
 	// watcher can never read it halfway through somebody else's write.
 	clipMu sync.Mutex
 
-	mu        sync.Mutex
-	lastHash  string // fingerprint of the clipboard content currently in sync
-	lastBytes int
-	lastFrom  string
-	lastSync  time.Time
+	// receiveDir is where incoming files are unpacked; empty when it could
+	// not be resolved, which fails file payloads and nothing else.
+	receiveDir string
+
+	mu         sync.Mutex
+	lastHash   string // fingerprint of the clipboard content currently in sync
+	lastBytes  int
+	lastFrom   string
+	lastFormat string // what the last sync was: text (empty), files, or an image
+	lastCount  int    // how many files, when lastFormat says files
+	lastSync   time.Time
 	// pendingHash is content that has been copied but has not reached anybody
 	// yet. It is deliberately not lastHash: calling it synced is how a copy
 	// made before the first peer turned up used to disappear for good.
@@ -83,6 +97,12 @@ type Node struct {
 	// skippedHash is content too large to sync. Kept apart from lastHash so
 	// `henri status` does not describe one payload with another's size.
 	skippedHash string
+	// seenContent remembers the content identity of file payloads recently
+	// sent or applied. Text and images echo-suppress by byte equality; a file
+	// trip renames and re-homes everything, so identity has to be carried by
+	// the contents. Without this, two daemons sharing one clipboard bounce a
+	// file copy back and forth forever, unpacking it again on every lap.
+	seenContent map[string]time.Time
 	clipErr     string // why the last clipboard read failed, if it did
 	watchMode   string // how changes are noticed: an event source, or polling
 
@@ -122,6 +142,9 @@ func NewWith(cfg *config.Config, log *slog.Logger, clip Clipboard) (*Node, error
 	if local.MaxBytes <= 0 {
 		local.MaxBytes = config.DefaultMaxBytes
 	}
+	if local.MaxFileBytes <= 0 {
+		local.MaxFileBytes = config.DefaultMaxFileBytes
+	}
 	cfg = &local
 
 	master, err := cfg.MasterKey()
@@ -137,15 +160,22 @@ func NewWith(cfg *config.Config, log *slog.Logger, clip Clipboard) (*Node, error
 		return nil, err
 	}
 	n := &Node{
-		cfg:       cfg,
-		sync:      syncBox,
-		disco:     discoBox,
-		peers:     newPeerSet(cfg.Peers),
-		clip:      clip,
-		log:       log,
-		replay:    newReplayCache(maxReplay),
-		sem:       make(chan struct{}, maxHandlers),
-		startedAt: time.Now(),
+		cfg:         cfg,
+		sync:        syncBox,
+		disco:       discoBox,
+		peers:       newPeerSet(cfg.Peers),
+		clip:        clip,
+		log:         log,
+		replay:      newReplayCache(maxReplay),
+		sem:         make(chan struct{}, maxHandlers),
+		startedAt:   time.Now(),
+		seenContent: map[string]time.Time{},
+	}
+	if dir, err := cfg.ReceivePath(); err == nil {
+		n.receiveDir = dir
+	} else {
+		// Text still syncs; only file payloads need somewhere to land.
+		log.Warn("no directory to receive files into; file payloads will be refused", "err", err)
 	}
 	n.join = n.joinMulticast
 	return n, nil
@@ -166,16 +196,17 @@ func (n *Node) Run(ctx context.Context) error {
 		"discovery", n.cfg.Discovery)
 
 	// Seed lastHash with whatever is already on the clipboard so starting the
-	// daemon does not immediately broadcast stale content. A read that fails
-	// here is the interesting case -- a daemon started outside the graphical
-	// session -- and used to be thrown away, leaving `henri status` claiming
-	// everything was fine until the first poll tick.
-	if data, err := n.clip.Read(); err != nil {
+	// daemon does not immediately broadcast stale content -- files and images
+	// included. A read that fails here is the interesting case -- a daemon
+	// started outside the graphical session -- and used to be thrown away,
+	// leaving `henri status` claiming everything was fine until the first
+	// poll tick.
+	if snap, err := n.clip.Look(); err != nil {
 		n.noteClipErr(err)
-	} else if len(data) > 0 {
+	} else if fp, size, _ := n.fingerprint(snap); fp != "" {
 		n.mu.Lock()
-		n.lastHash = secure.Hash(data)
-		n.lastBytes = len(data)
+		n.lastHash = fp
+		n.lastBytes = size
 		n.mu.Unlock()
 	}
 
@@ -314,6 +345,123 @@ func (n *Node) noteClipOK() {
 	}
 }
 
+// fingerprint is the local identity of whatever the clipboard holds, plus a
+// size for the caps and the status page. An empty fingerprint means there is
+// nothing to sync.
+//
+// Text and images fingerprint their bytes. Files fingerprint their paths with
+// each one's size and modify time -- deliberately not their contents, because
+// hashing a folder of gigabytes two and a half times a second is not a
+// watcher, it is a space heater. Copying the same paths after editing a file
+// re-syncs; editing deep inside a copied folder may not, and a fresh copy is
+// the answer there.
+func (n *Node) fingerprint(snap clipboard.Snapshot) (fp string, size int, err error) {
+	switch snap.Kind {
+	case clipboard.ContentFiles:
+		if len(snap.Paths) == 0 {
+			return "", 0, nil
+		}
+		var b strings.Builder
+		b.WriteString("files\x00")
+		for _, p := range snap.Paths {
+			info, err := os.Stat(p)
+			if err != nil {
+				// The copy outlived its files; nothing worth syncing.
+				return "", 0, err
+			}
+			fmt.Fprintf(&b, "%s\x00%d\x00%d\x00", p, info.Size(), info.ModTime().UnixNano())
+			if info.Mode().IsRegular() {
+				size += int(info.Size())
+			}
+		}
+		return secure.Hash([]byte(b.String())), size, nil
+	case clipboard.ContentImage:
+		if len(snap.Image) == 0 {
+			return "", 0, nil
+		}
+		return secure.Hash(snap.Image), len(snap.Image), nil
+	default:
+		if len(snap.Text) == 0 {
+			return "", 0, nil
+		}
+		return secure.Hash(snap.Text), len(snap.Text), nil
+	}
+}
+
+// contentSeen reports whether this file content has been sent or applied
+// within the echo window. It never records; rememberContent does that, and
+// only after the send or the apply actually happened -- recording on a failed
+// attempt would suppress its own retry.
+func (n *Node) contentSeen(content string) bool {
+	if content == "" {
+		return false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	at, ok := n.seenContent[content]
+	return ok && time.Since(at) < contentEcho
+}
+
+// rememberContent records that this file content just travelled.
+func (n *Node) rememberContent(content string) {
+	if content == "" {
+		return
+	}
+	now := time.Now()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.seenContent) > 64 {
+		for k, at := range n.seenContent {
+			if now.Sub(at) >= contentEcho {
+				delete(n.seenContent, k)
+			}
+		}
+	}
+	n.seenContent[content] = now
+}
+
+// payload is one clipboard's worth of content on its way to the group.
+type payload struct {
+	format  string   // FormatText, FormatFiles or FormatImage
+	data    []byte   // the text, the archive, or the PNG
+	names   []string // FormatFiles: the archive's top-level names
+	fp      string   // the local fingerprint claimed when the push lands
+	content string   // FormatFiles: the name-independent content identity
+}
+
+// build turns a snapshot into what actually travels. For files that means
+// archiving them now, at send time, so a retry archives the files as they are
+// rather than as they were.
+func (n *Node) build(snap clipboard.Snapshot, fp string) (payload, error) {
+	switch snap.Kind {
+	case clipboard.ContentFiles:
+		data, names, content, err := pack.Build(snap.Paths, n.cfg.MaxFileBytes)
+		if err != nil {
+			return payload{}, err
+		}
+		return payload{format: FormatFiles, data: data, names: names, fp: fp, content: content}, nil
+	case clipboard.ContentImage:
+		return payload{format: FormatImage, data: snap.Image, fp: fp}, nil
+	default:
+		return payload{format: FormatText, data: snap.Text, fp: fp}, nil
+	}
+}
+
+// describe is how a payload reads in a log line.
+func describe(format string, count int) string {
+	switch format {
+	case FormatFiles:
+		if count == 1 {
+			return "1 file"
+		}
+		return fmt.Sprintf("%d files", count)
+	case FormatImage:
+		return "an image"
+	default:
+		return "text"
+	}
+}
+
 // checkClipboard reads the clipboard once and pushes it if it is new.
 func (n *Node) checkClipboard(ctx context.Context) {
 	// Held across the read and the decision that follows it. applyClip holds
@@ -322,7 +470,7 @@ func (n *Node) checkClipboard(ctx context.Context) {
 	// still holds another -- which it would read as a local copy, and send.
 	n.clipMu.Lock()
 
-	data, err := n.clip.Read()
+	snap, err := n.clip.Look()
 	if err != nil {
 		n.clipMu.Unlock()
 		n.noteClipErr(err)
@@ -330,45 +478,52 @@ func (n *Node) checkClipboard(ctx context.Context) {
 	}
 	n.noteClipOK()
 
-	if len(data) == 0 {
+	fp, size, err := n.fingerprint(snap)
+	if err != nil || fp == "" {
+		// Nothing to sync, or a file copy whose files are already gone.
 		n.clipMu.Unlock()
 		return
 	}
-	h := secure.Hash(data)
 	now := time.Now()
 
-	if len(data) > n.cfg.MaxBytes {
+	// The early size gate. Text and images know their size exactly; a file
+	// copy knows the raw total, which is what pack.Build enforces too.
+	limit := n.cfg.MaxBytes
+	if snap.Kind != clipboard.ContentText {
+		limit = n.cfg.MaxFileBytes
+	}
+	if size > limit {
 		n.mu.Lock()
-		warn := n.skippedHash != h
-		n.skippedHash = h
+		warn := n.skippedHash != fp
+		n.skippedHash = fp
 		n.pendingHash = "" // whatever was waiting is not on the clipboard now
 		n.mu.Unlock()
 		n.clipMu.Unlock()
 		if warn {
-			n.log.Warn("clipboard too large to sync", "bytes", len(data), "limit", n.cfg.MaxBytes)
+			n.log.Warn("clipboard too large to sync", "bytes", size, "limit", limit)
 		}
 		return
 	}
 
 	n.mu.Lock()
 	n.skippedHash = ""
-	if h == n.lastHash {
+	if fp == n.lastHash {
 		n.mu.Unlock()
 		n.clipMu.Unlock()
 		return
 	}
-	first := n.pendingHash != h
+	first := n.pendingHash != fp
 	switch {
 	case first:
-		n.pendingHash, n.pendingSince, n.pendingTried, n.pendingWait = h, now, now, pendingRetry
+		n.pendingHash, n.pendingSince, n.pendingTried, n.pendingWait = fp, now, now, pendingRetry
 	case now.Sub(n.pendingSince) > pendingFor:
 		// Long enough. Stop offering a device that has only just appeared
 		// something the user copied several minutes ago.
-		n.lastHash, n.lastBytes, n.lastFrom, n.lastSync = h, len(data), "local", now
+		n.lastHash, n.lastBytes, n.lastFrom, n.lastSync = fp, size, "local", now
 		n.pendingHash = ""
 		n.mu.Unlock()
 		n.clipMu.Unlock()
-		n.log.Warn("gave up on a copy that reached no peer", "bytes", len(data))
+		n.log.Warn("gave up on a copy that reached no peer", "bytes", size)
 		return
 	case now.Sub(n.pendingTried) < n.pendingWait:
 		n.mu.Unlock()
@@ -382,23 +537,57 @@ func (n *Node) checkClipboard(ctx context.Context) {
 	n.mu.Unlock()
 	n.clipMu.Unlock()
 
-	sent, tried := n.push(ctx, data, h)
+	p, err := n.build(snap, fp)
+	if err == nil && p.format == FormatFiles && n.contentSeen(p.content) {
+		// These are the very files that just went around -- unpacked here or
+		// on another daemon watching this same clipboard -- wearing new paths.
+		// Claim them as synced and stay quiet, or two daemons on one machine
+		// lob the copy back and forth forever.
+		n.mu.Lock()
+		if n.lastHash == prev {
+			n.lastHash, n.lastBytes, n.lastFrom, n.lastSync = fp, size, "local", now
+			n.lastFormat, n.lastCount = p.format, len(p.names)
+		}
+		if n.pendingHash == fp {
+			n.pendingHash = ""
+		}
+		n.mu.Unlock()
+		n.log.Debug("files match content synced moments ago; not sending them again")
+		return
+	}
+	if err != nil {
+		// Archiving said no -- the files grew past the limit, vanished, or
+		// cannot be read. Warn once per copy rather than once per tick.
+		n.mu.Lock()
+		warn := n.skippedHash != fp
+		n.skippedHash, n.pendingHash = fp, ""
+		n.mu.Unlock()
+		if warn {
+			n.log.Warn("cannot send the copied files", "err", err)
+		}
+		return
+	}
+
+	sent, tried := n.push(ctx, p)
 	if sent == 0 {
 		// Leaving lastHash alone is the whole point: it is what makes the next
 		// tick try this content again instead of calling it synced.
 		if first && tried == 0 {
-			n.log.Warn("copied, but no peer is known yet; will keep trying", "bytes", len(data))
+			n.log.Warn("copied, but no peer is known yet; will keep trying",
+				"what", describe(p.format, len(p.names)), "bytes", len(p.data))
 		}
 		return
 	}
+	n.rememberContent(p.content)
 
 	n.mu.Lock()
 	// Something may have written the clipboard while the push was in flight.
 	// That content is newer than this, so leave its fingerprint alone.
 	if n.lastHash == prev {
-		n.lastHash, n.lastBytes, n.lastFrom, n.lastSync = h, len(data), "local", now
+		n.lastHash, n.lastBytes, n.lastFrom, n.lastSync = fp, size, "local", now
+		n.lastFormat, n.lastCount = p.format, len(p.names)
 	}
-	if n.pendingHash == h {
+	if n.pendingHash == fp {
 		n.pendingHash = ""
 	}
 	n.mu.Unlock()
@@ -406,14 +595,17 @@ func (n *Node) checkClipboard(ctx context.Context) {
 
 // push sends one clipboard payload to every known peer, concurrently. It
 // returns how many peers took it and how many were tried.
-func (n *Node) push(ctx context.Context, data []byte, hash string) (sent, tried int) {
+func (n *Node) push(ctx context.Context, p payload) (sent, tried int) {
 	addrs := n.peers.addrs()
 	if len(addrs) == 0 {
-		n.log.Debug("copied, but no peers are known yet", "bytes", len(data))
+		n.log.Debug("copied, but no peers are known yet", "bytes", len(p.data))
 		return 0, 0
 	}
 	msg := &Message{
-		V:      ProtocolVersion,
+		// Text stays v1 so older devices keep receiving it; files and images
+		// go as v2, which an old device refuses whole instead of pasting an
+		// archive as if it were text.
+		V:      versionFor(p.format),
 		Kind:   KindClip,
 		Device: n.cfg.DeviceID,
 		Name:   n.cfg.DeviceName,
@@ -421,9 +613,11 @@ func (n *Node) push(ctx context.Context, data []byte, hash string) (sent, tried 
 		// Without this the far end has no way to learn where we live, and sync
 		// silently runs one way the moment discovery stops working. Devices
 		// that predate it ignore the field.
-		Port: n.cfg.ListenPort,
-		Hash: hash,
-		Data: data,
+		Port:   n.cfg.ListenPort,
+		Hash:   secure.Hash(p.data),
+		Data:   p.data,
+		Format: p.format,
+		Names:  p.names,
 	}
 
 	var wg sync.WaitGroup
@@ -457,7 +651,8 @@ func (n *Node) push(ctx context.Context, data []byte, hash string) (sent, tried 
 		return 0, len(addrs)
 	}
 	n.sent.Add(1)
-	n.log.Info("sent clipboard", "bytes", len(data), "peers", sent, "of", len(addrs))
+	n.log.Info("sent clipboard", "what", describe(p.format, len(p.names)),
+		"bytes", len(p.data), "peers", sent, "of", len(addrs))
 	return sent, len(addrs)
 }
 
@@ -474,7 +669,7 @@ func (n *Node) request(ctx context.Context, addr string, msg *Message) (*Message
 	if err := writeFrame(conn, n.sync, msg); err != nil {
 		return nil, err
 	}
-	resp, _, err := readFrame(conn, n.sync, frameLimit(n.cfg.MaxBytes))
+	resp, _, err := readFrame(conn, n.sync, n.frameCap())
 	if err != nil {
 		return nil, err
 	}
@@ -482,6 +677,16 @@ func (n *Node) request(ctx context.Context, addr string, msg *Message) (*Message
 		return nil, errors.New(resp.Err)
 	}
 	return resp, nil
+}
+
+// frameCap is the biggest inbound frame this device would ever agree to: its
+// own payload limits, whichever is larger, plus encoding overhead.
+func (n *Node) frameCap() int {
+	m := n.cfg.MaxBytes
+	if n.cfg.MaxFileBytes > m {
+		m = n.cfg.MaxFileBytes
+	}
+	return frameLimit(m)
 }
 
 // serve accepts inbound peer connections.
@@ -544,7 +749,7 @@ func (n *Node) handle(ctx context.Context, conn net.Conn) {
 	defer stop()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	msg, nonce, err := readFrame(conn, n.sync, frameLimit(n.cfg.MaxBytes))
+	msg, nonce, err := readFrame(conn, n.sync, n.frameCap())
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
 			// A failure here is usually a port scan or a device with the wrong
@@ -574,8 +779,12 @@ func (n *Node) handle(ctx context.Context, conn net.Conn) {
 			reply.Kind = KindState
 			reply.State = n.state()
 		case KindPush:
-			if err := n.pushCurrent(ctx, msg.Primary); err != nil {
+			format, count, err := n.pushCurrent(ctx, msg.Primary)
+			if err != nil {
 				reply.Err = err.Error()
+			} else {
+				// So `henri send` can say what was sent instead of guessing.
+				reply.Format, reply.Count = format, count
 			}
 		default:
 			reply.Err = fmt.Sprintf("unknown message kind %q", msg.Kind)
@@ -628,8 +837,12 @@ func (n *Node) applyClip(msg *Message, remote net.Addr) error {
 	if len(msg.Data) == 0 {
 		return errors.New("empty payload")
 	}
-	if len(msg.Data) > n.cfg.MaxBytes {
-		return fmt.Errorf("payload of %d bytes exceeds this device's limit of %d", len(msg.Data), n.cfg.MaxBytes)
+	limit := n.cfg.MaxBytes
+	if msg.Format != FormatText {
+		limit = n.cfg.MaxFileBytes
+	}
+	if len(msg.Data) > limit {
+		return fmt.Errorf("payload of %d bytes exceeds this device's limit of %d", len(msg.Data), limit)
 	}
 	// Once: the payload can be megabytes, and this used to hash it twice.
 	hash := secure.Hash(msg.Data)
@@ -644,43 +857,106 @@ func (n *Node) applyClip(msg *Message, remote net.Addr) error {
 		n.peers.seen(msg.Device, msg.Name, net.JoinHostPort(host, fmt.Sprint(msg.Port)))
 	}
 
+	switch msg.Format {
+	case FormatText:
+		return n.applyLocal(msg, hash, len(msg.Data), 0, func() error { return n.clip.Write(msg.Data) })
+	case FormatImage:
+		return n.applyLocal(msg, hash, len(msg.Data), 0, func() error { return n.clip.WriteImage(msg.Data) })
+	case FormatFiles:
+		return n.applyFiles(msg)
+	default:
+		// A format from a build newer than this one. Refusing with a name is
+		// kinder than writing bytes we do not understand somewhere visible.
+		return fmt.Errorf("this build does not understand %q payloads; upgrade henri here", msg.Format)
+	}
+}
+
+// applyLocal claims a fingerprint and runs one clipboard write, undoing the
+// claim if the write fails so the sender's retry is not acknowledged away.
+func (n *Node) applyLocal(msg *Message, fp string, size, count int, write func() error) error {
 	n.clipMu.Lock()
 	defer n.clipMu.Unlock()
 
 	n.mu.Lock()
-	if hash == n.lastHash {
+	if fp == n.lastHash {
 		n.mu.Unlock()
 		return nil // already in sync; do not bounce it back
 	}
-	// Claim the hash before writing so the watch loop sees the new content as
-	// already-known and does not re-broadcast it.
+	// Claim the fingerprint before writing so the watch loop sees the new
+	// content as already-known and does not re-broadcast it.
 	prevHash, prevBytes, prevFrom, prevSync := n.lastHash, n.lastBytes, n.lastFrom, n.lastSync
-	n.lastHash, n.lastBytes = hash, len(msg.Data)
+	prevFormat, prevCount := n.lastFormat, n.lastCount
+	n.lastHash, n.lastBytes = fp, size
+	n.lastFormat, n.lastCount = msg.Format, count
 	n.lastFrom, n.lastSync = displayName(msg), time.Now()
 	n.mu.Unlock()
 
-	if err := n.clip.Write(msg.Data); err != nil {
+	if err := write(); err != nil {
 		// Put the old fingerprint back, or one passing failure loses this
 		// payload for good: the sender's next attempt would match lastHash and
 		// be dropped with a cheerful acknowledgement.
 		n.mu.Lock()
 		n.lastHash, n.lastBytes = prevHash, prevBytes
 		n.lastFrom, n.lastSync = prevFrom, prevSync
+		n.lastFormat, n.lastCount = prevFormat, prevCount
 		n.mu.Unlock()
 		return err
 	}
 	n.received.Add(1)
-	n.log.Info("received clipboard", "from", displayName(msg), "bytes", len(msg.Data))
+	n.log.Info("received clipboard", "what", describe(msg.Format, count),
+		"from", displayName(msg), "bytes", len(msg.Data))
 	return nil
 }
 
-// pushCurrent sends the clipboard, or the highlighted text, to the group.
+// applyFiles unpacks a files payload and puts the unpacked paths on the
+// clipboard, so a paste here lands the real files.
+func (n *Node) applyFiles(msg *Message) error {
+	if n.receiveDir == "" {
+		return errors.New("this device has nowhere to receive files; set receive_dir in its config")
+	}
+	// Unpacking happens before any lock: it is disk work, and the clipboard
+	// has no business waiting on it.
+	created, content, err := pack.Extract(msg.Data, n.receiveDir, n.cfg.MaxFileBytes)
+	if err != nil {
+		return err
+	}
+	if n.contentSeen(content) {
+		// The same files came around again under new names -- an echo, not a
+		// copy. Acknowledge so the sender stops, and take the duplicates back
+		// off the disk.
+		for _, p := range created {
+			os.RemoveAll(p)
+		}
+		n.log.Debug("files match content synced moments ago; not applying them again")
+		return nil
+	}
+	// The claim is the fingerprint of what the watcher will see here: the
+	// unpacked paths, not the sender's. It has to be computed the same way.
+	fp, size, err := n.fingerprint(clipboard.Snapshot{Kind: clipboard.ContentFiles, Paths: created})
+	if err != nil {
+		return err
+	}
+	err = n.applyLocal(msg, fp, size, len(created), func() error { return n.clip.WriteFiles(created) })
+	if err != nil {
+		// The files themselves stay: they are safely in the receive directory
+		// and picking them up there beats downloading them again.
+		return fmt.Errorf("%d files landed in %s, but the clipboard write failed: %w", len(created), n.receiveDir, err)
+	}
+	n.rememberContent(content)
+	return nil
+}
+
+// pushCurrent sends the clipboard, or the highlighted text, to the group. It
+// returns what it sent -- the format and, for files, how many -- so the CLI
+// can say something true.
 //
 // With primary set it takes the PRIMARY selection and puts it on the local
 // clipboard on the way past, so one keypress both copies and sends. That is the
 // whole trick for compositors henri cannot watch: highlighted text is already
-// published, so nothing has to synthesise a Ctrl+C to get at it.
-func (n *Node) pushCurrent(ctx context.Context, primary bool) error {
+// published, so nothing has to synthesise a Ctrl+C to get at it. Highlighted
+// text is always text; when the clipboard holds files or an image, those win
+// only after the selection turns out to be empty.
+func (n *Node) pushCurrent(ctx context.Context, primary bool) (string, int, error) {
 	n.clipMu.Lock()
 
 	var data []byte
@@ -693,34 +969,42 @@ func (n *Node) pushCurrent(ctx context.Context, primary bool) error {
 			// why the key did nothing at all on those platforms.
 			if !errors.Is(err, clipboard.ErrNoPrimary) {
 				n.clipMu.Unlock()
-				return err
+				return "", 0, err
 			}
 			data = nil
 		}
 	}
+
 	if len(data) == 0 {
-		// Nothing highlighted; fall back to the clipboard so the key still does
-		// something sensible.
+		// Nothing highlighted; fall back to the clipboard, whatever it holds,
+		// so the key still does something sensible.
 		primary = false
-		if data, err = n.clip.Read(); err != nil {
+		snap, err := n.clip.Look()
+		if err != nil {
 			n.clipMu.Unlock()
-			return err
+			return "", 0, err
 		}
+		if snap.Kind != clipboard.ContentText {
+			return n.pushRich(ctx, snap)
+		}
+		data = snap.Text
 	}
 	if len(data) == 0 {
 		n.clipMu.Unlock()
-		return errors.New("nothing is highlighted and the clipboard is empty")
+		return "", 0, errors.New("nothing is highlighted and the clipboard is empty")
 	}
 	if len(data) > n.cfg.MaxBytes {
 		n.clipMu.Unlock()
-		return fmt.Errorf("clipboard is %d bytes, over the %d byte limit", len(data), n.cfg.MaxBytes)
+		return "", 0, fmt.Errorf("clipboard is %d bytes, over the %d byte limit", len(data), n.cfg.MaxBytes)
 	}
 
 	h := secure.Hash(data)
 	n.mu.Lock()
 	prevHash, prevBytes, prevFrom, prevSync := n.lastHash, n.lastBytes, n.lastFrom, n.lastSync
+	prevFormat, prevCount := n.lastFormat, n.lastCount
 	prevPending, prevPendingSince, prevPendingTried, prevPendingWait := n.pendingHash, n.pendingSince, n.pendingTried, n.pendingWait
 	n.lastHash, n.lastBytes = h, len(data)
+	n.lastFormat, n.lastCount = FormatText, 0
 	n.lastFrom, n.lastSync = "local", time.Now()
 	n.pendingHash = ""
 	n.mu.Unlock()
@@ -737,23 +1021,66 @@ func (n *Node) pushCurrent(ctx context.Context, primary bool) error {
 			n.mu.Lock()
 			n.lastHash, n.lastBytes = prevHash, prevBytes
 			n.lastFrom, n.lastSync = prevFrom, prevSync
+			n.lastFormat, n.lastCount = prevFormat, prevCount
 			n.pendingHash, n.pendingSince, n.pendingTried, n.pendingWait = prevPending, prevPendingSince, prevPendingTried, prevPendingWait
 			n.mu.Unlock()
 			n.clipMu.Unlock()
-			return fmt.Errorf("could not copy to this device's clipboard, so nothing was sent: %w", err)
+			return "", 0, fmt.Errorf("could not copy to this device's clipboard, so nothing was sent: %w", err)
 		}
 	}
 	n.clipMu.Unlock()
 
-	if sent, tried := n.push(ctx, data, h); sent == 0 && tried == 0 {
+	if sent, tried := n.push(ctx, payload{format: FormatText, data: data, fp: h}); sent == 0 && tried == 0 {
 		n.log.Warn("sent, but no peer is known yet", "bytes", len(data))
 	}
-	return nil
+	return FormatText, 0, nil
+}
+
+// pushRich sends the files or image the clipboard holds. Called with clipMu
+// held; releases it.
+func (n *Node) pushRich(ctx context.Context, snap clipboard.Snapshot) (string, int, error) {
+	fp, size, err := n.fingerprint(snap)
+	if err != nil {
+		n.clipMu.Unlock()
+		return "", 0, fmt.Errorf("the copied files are gone: %w", err)
+	}
+	if fp == "" {
+		n.clipMu.Unlock()
+		return "", 0, errors.New("the clipboard is empty")
+	}
+	if snap.Kind == clipboard.ContentImage && size > n.cfg.MaxFileBytes {
+		n.clipMu.Unlock()
+		return "", 0, fmt.Errorf("the image is %d bytes, over the %d byte limit", size, n.cfg.MaxFileBytes)
+	}
+
+	n.mu.Lock()
+	n.lastHash, n.lastBytes = fp, size
+	n.lastFrom, n.lastSync = "local", time.Now()
+	n.pendingHash = ""
+	n.mu.Unlock()
+	n.clipMu.Unlock()
+
+	p, err := n.build(snap, fp)
+	if err != nil {
+		return "", 0, err
+	}
+	n.mu.Lock()
+	n.lastFormat, n.lastCount = p.format, len(p.names)
+	n.mu.Unlock()
+	sent, tried := n.push(ctx, p)
+	if sent == 0 && tried == 0 {
+		n.log.Warn("sent, but no peer is known yet", "what", describe(p.format, len(p.names)))
+	}
+	if sent > 0 {
+		n.rememberContent(p.content)
+	}
+	return p.format, len(p.names), nil
 }
 
 func (n *Node) state() *State {
 	n.mu.Lock()
 	lastHash, lastBytes, lastFrom, lastSync := n.lastHash, n.lastBytes, n.lastFrom, n.lastSync
+	lastFormat, lastCount := n.lastFormat, n.lastCount
 	clipErr, watchMode := n.clipErr, n.watchMode
 	n.mu.Unlock()
 
@@ -771,6 +1098,8 @@ func (n *Node) state() *State {
 		LastHash:     shortHash(lastHash),
 		LastBytes:    lastBytes,
 		LastFrom:     lastFrom,
+		LastFormat:   lastFormat,
+		LastCount:    lastCount,
 		Sent:         n.sent.Load(),
 		Received:     n.received.Load(),
 		Beacons:      n.beacons.Load(),

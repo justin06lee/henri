@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/justin06lee/henri/internal/clipboard"
 	"github.com/justin06lee/henri/internal/config"
+	"github.com/justin06lee/henri/internal/pack"
 	"github.com/justin06lee/henri/internal/secure"
 )
 
@@ -26,6 +29,8 @@ import (
 type fakeClipboard struct {
 	mu      sync.Mutex
 	data    []byte
+	files   []string
+	image   []byte
 	primary []byte
 	// The failure modes a real clipboard has and this one used not to: a
 	// backend with no PRIMARY selection, a write that fails, and a write that
@@ -39,6 +44,19 @@ func (f *fakeClipboard) Read() ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]byte(nil), f.data...), nil
+}
+
+func (f *fakeClipboard) Look() (clipboard.Snapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case len(f.files) > 0:
+		return clipboard.Snapshot{Kind: clipboard.ContentFiles, Paths: append([]string(nil), f.files...)}, nil
+	case len(f.image) > 0:
+		return clipboard.Snapshot{Kind: clipboard.ContentImage, Image: append([]byte(nil), f.image...)}, nil
+	default:
+		return clipboard.Snapshot{Kind: clipboard.ContentText, Text: append([]byte(nil), f.data...)}, nil
+	}
 }
 
 func (f *fakeClipboard) Write(d []byte) error {
@@ -56,7 +74,62 @@ func (f *fakeClipboard) Write(d []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.data = append([]byte(nil), d...)
+	f.files, f.image = nil, nil
 	return nil
+}
+
+func (f *fakeClipboard) WriteFiles(paths []string) error {
+	f.mu.Lock()
+	err := f.writeErr
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.files = append([]string(nil), paths...)
+	f.data, f.image = nil, nil
+	return nil
+}
+
+func (f *fakeClipboard) WriteImage(png []byte) error {
+	f.mu.Lock()
+	err := f.writeErr
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.image = append([]byte(nil), png...)
+	f.data, f.files = nil, nil
+	return nil
+}
+
+func (f *fakeClipboard) setFiles(paths []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.files = append([]string(nil), paths...)
+	f.data, f.image = nil, nil
+}
+
+func (f *fakeClipboard) getFiles() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.files...)
+}
+
+func (f *fakeClipboard) setImage(png []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.image = append([]byte(nil), png...)
+	f.data, f.files = nil, nil
+}
+
+func (f *fakeClipboard) getImage() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]byte(nil), f.image...)
 }
 
 func (f *fakeClipboard) ReadPrimary() ([]byte, error) {
@@ -98,6 +171,7 @@ func (f *fakeClipboard) set(s string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.data = []byte(s)
+	f.files, f.image = nil, nil
 }
 
 func (f *fakeClipboard) get() string {
@@ -143,6 +217,10 @@ func startNode(t *testing.T, ctx context.Context, name, group, key string, port 
 		Peers:         peers,
 		PollMillis:    20,
 		MaxBytes:      1 << 20,
+		MaxFileBytes:  1 << 20,
+		// Never the real ~/Downloads: tests must not write into the
+		// developer's home.
+		ReceiveDir: t.TempDir(),
 	}
 	clip := &fakeClipboard{}
 	n, err := NewWith(cfg, quietLogger(), clip)
@@ -364,7 +442,7 @@ func TestExistingClipboardIsNotBroadcastOnStart(t *testing.T) {
 	cfg := &config.Config{
 		GroupID: group, Key: key, DeviceID: "alpha-id", DeviceName: "alpha",
 		ListenPort: portA, Peers: []string{fmt.Sprintf("127.0.0.1:%d", portB)},
-		PollMillis: 20, MaxBytes: 1 << 20,
+		PollMillis: 20, MaxBytes: 1 << 20, MaxFileBytes: 1 << 20,
 	}
 	clipA := &fakeClipboard{}
 	clipA.set("already here before henri started")
@@ -511,7 +589,8 @@ func offlineNode(t *testing.T, name string) *Node {
 	t.Helper()
 	cfg := &config.Config{
 		GroupID: "test-group", Key: groupKey(t), DeviceID: name + "-id", DeviceName: name,
-		ListenPort: freePort(t), PollMillis: 20, MaxBytes: 1 << 20,
+		ListenPort: freePort(t), PollMillis: 20, MaxBytes: 1 << 20, MaxFileBytes: 1 << 20,
+		ReceiveDir: t.TempDir(),
 	}
 	n, err := NewWith(cfg, quietLogger(), &fakeClipboard{})
 	if err != nil {
@@ -797,7 +876,8 @@ func TestCopyMadeBeforeAnyPeerIsKnownIsNotLost(t *testing.T) {
 func TestFailedHighlightedCopyRollsTheFingerprintBack(t *testing.T) {
 	cfg := &config.Config{
 		GroupID: "test-group", Key: groupKey(t), DeviceID: "alpha-id", DeviceName: "alpha",
-		ListenPort: freePort(t), PollMillis: 20, MaxBytes: 1 << 20,
+		ListenPort: freePort(t), PollMillis: 20, MaxBytes: 1 << 20, MaxFileBytes: 1 << 20,
+		ReceiveDir: t.TempDir(),
 	}
 	clip := &fakeClipboard{}
 	n, err := NewWith(cfg, quietLogger(), clip)
@@ -812,7 +892,7 @@ func TestFailedHighlightedCopyRollsTheFingerprintBack(t *testing.T) {
 
 	clip.highlight("new")
 	clip.failWrites(errors.New("no display"))
-	if err := n.pushCurrent(context.Background(), true); err == nil {
+	if _, _, err := n.pushCurrent(context.Background(), true); err == nil {
 		t.Fatal("a failed clipboard write did not report an error")
 	}
 
@@ -821,5 +901,216 @@ func TestFailedHighlightedCopyRollsTheFingerprintBack(t *testing.T) {
 	n.mu.Unlock()
 	if got != secure.Hash([]byte("old")) {
 		t.Fatal("the fingerprint was not rolled back; the watcher would re-broadcast the old clipboard")
+	}
+}
+
+// A file copied on one device must land on the other as real files, on the
+// clipboard as references, and must not bounce back.
+func TestFilesPropagateBetweenPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+	a, clipA := startNode(t, ctx, "alpha", group, key, portA, []string{fmt.Sprintf("127.0.0.1:%d", portB)})
+	b, clipB := startNode(t, ctx, "beta", group, key, portB, nil)
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("travelling"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "album"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "album", "one.txt"), []byte("track"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clipA.setFiles([]string{filepath.Join(src, "notes.txt"), filepath.Join(src, "album")})
+
+	waitFor(t, "beta's clipboard to hold the received files", func() bool { return len(clipB.getFiles()) == 2 })
+	got := clipB.getFiles()
+	for _, p := range got {
+		if !strings.HasPrefix(p, b.receiveDir) {
+			t.Fatalf("received file %q is outside beta's receive dir %q", p, b.receiveDir)
+		}
+	}
+	content, err := os.ReadFile(filepath.Join(b.receiveDir, "notes.txt"))
+	if err != nil || string(content) != "travelling" {
+		t.Fatalf("notes.txt = %q, %v", content, err)
+	}
+	content, err = os.ReadFile(filepath.Join(b.receiveDir, "album", "one.txt"))
+	if err != nil || string(content) != "track" {
+		t.Fatalf("album/one.txt = %q, %v", content, err)
+	}
+
+	// The echo guard, for files: beta must not re-broadcast what it received.
+	time.Sleep(300 * time.Millisecond)
+	if got := b.sent.Load(); got != 0 {
+		t.Fatalf("beta echoed the files back %d times", got)
+	}
+	if got := a.received.Load(); got != 0 {
+		t.Fatalf("alpha received its own files back %d times", got)
+	}
+}
+
+// An image copied on one device must arrive as the same bytes, and not echo.
+func TestImagePropagatesBetweenPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+	a, clipA := startNode(t, ctx, "alpha", group, key, portA, []string{fmt.Sprintf("127.0.0.1:%d", portB)})
+	b, clipB := startNode(t, ctx, "beta", group, key, portB, nil)
+
+	png := []byte("\x89PNG\r\n\x1a\nnot really pixels but faithfully carried")
+	clipA.setImage(png)
+
+	waitFor(t, "beta to receive the image", func() bool { return bytes.Equal(clipB.getImage(), png) })
+
+	time.Sleep(300 * time.Millisecond)
+	if got := b.sent.Load(); got != 0 {
+		t.Fatalf("beta echoed the image back %d times", got)
+	}
+	if got := a.received.Load(); got != 0 {
+		t.Fatalf("alpha received its own image back %d times", got)
+	}
+}
+
+// Files past the limit are skipped with a warning, not sent.
+func TestOversizedFileCopyIsNotSent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+	a, clipA := startNode(t, ctx, "alpha", group, key, portA, []string{fmt.Sprintf("127.0.0.1:%d", portB)})
+	_, clipB := startNode(t, ctx, "beta", group, key, portB, nil)
+
+	src := t.TempDir()
+	big := make([]byte, (1<<20)+1) // one byte over startNode's MaxFileBytes
+	if err := os.WriteFile(filepath.Join(src, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clipA.setFiles([]string{filepath.Join(src, "big.bin")})
+
+	time.Sleep(400 * time.Millisecond)
+	if got := a.sent.Load(); got != 0 {
+		t.Fatalf("an oversized file copy was sent %d times", got)
+	}
+	if got := clipB.getFiles(); len(got) != 0 {
+		t.Fatalf("beta received %v", got)
+	}
+}
+
+// A files payload arrives as protocol v2; text stays v1 so old devices keep
+// syncing text. This sends a hand-built v2 frame end to end.
+func TestFilesArriveOverTheWireAsV2(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	port := freePort(t)
+	n, clip := startNode(t, ctx, "alpha", group, key, port, nil)
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "wire.txt"), []byte("framed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, names, _, err := pack.Build([]string{filepath.Join(src, "wire.txt")}, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	box := syncBox(t, group, key)
+	resp := exchange(t, port, box, &Message{
+		V: ProtocolVersionRich, Kind: KindClip, Device: "sender-id", Name: "sender",
+		TS: time.Now().UnixMilli(), Format: FormatFiles, Names: names,
+		Hash: secure.Hash(data), Data: data,
+	})
+	if resp.Err != "" {
+		t.Fatalf("the v2 files frame was refused: %s", resp.Err)
+	}
+	waitFor(t, "the file to land on the clipboard", func() bool { return len(clip.getFiles()) == 1 })
+	got, err := os.ReadFile(filepath.Join(n.receiveDir, "wire.txt"))
+	if err != nil || string(got) != "framed" {
+		t.Fatalf("wire.txt = %q, %v", got, err)
+	}
+}
+
+func TestTextTravelsAsV1(t *testing.T) {
+	if v := versionFor(FormatText); v != ProtocolVersion {
+		t.Fatalf("text travels as v%d; older devices would stop receiving it", v)
+	}
+	for _, f := range []string{FormatFiles, FormatImage} {
+		if v := versionFor(f); v != ProtocolVersionRich {
+			t.Fatalf("%s travels as v%d, want v%d so old devices refuse it whole", f, v, ProtocolVersionRich)
+		}
+	}
+}
+
+// Two daemons sharing one clipboard -- the single-box testing setup the
+// README describes -- must not lob a file copy back and forth forever. Text
+// never had this problem because its bytes survive the trip; files come back
+// renamed and re-homed, so their identity has to be carried by their content.
+func TestTwoDaemonsOnOneClipboardDoNotStormOverFiles(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	group, key := "test-group", groupKey(t)
+	portA, portB := freePort(t), freePort(t)
+
+	// One clipboard, two nodes: startNode would make two, so build by hand.
+	shared := &fakeClipboard{}
+	mk := func(name string, port, peer int) *Node {
+		cfg := &config.Config{
+			GroupID: group, Key: key, DeviceID: name + "-id", DeviceName: name,
+			ListenPort: port, PollMillis: 20, MaxBytes: 1 << 20, MaxFileBytes: 1 << 20,
+			Peers:      []string{fmt.Sprintf("127.0.0.1:%d", peer)},
+			ReceiveDir: t.TempDir(),
+		}
+		n, err := NewWith(cfg, quietLogger(), shared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- n.Run(ctx) }()
+		t.Cleanup(func() {
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Log("node did not shut down in time")
+			}
+		})
+		waitForPort(t, port)
+		return n
+	}
+	a := mk("alpha", portA, portB)
+	b := mk("beta", portB, portA)
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "travel.txt"), []byte("once only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shared.setFiles([]string{filepath.Join(src, "travel.txt")})
+
+	// Let it settle. Without the content guard this window produces a dozen
+	// laps and a receive dir full of "travel (2) (2) (2).txt".
+	time.Sleep(1200 * time.Millisecond)
+
+	for name, n := range map[string]*Node{"alpha": a, "beta": b} {
+		entries, err := os.ReadDir(n.receiveDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) > 1 {
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Fatalf("%s's receive dir filled with duplicates: %v", name, names)
+		}
+	}
+	if total := a.sent.Load() + b.sent.Load(); total > 3 {
+		t.Fatalf("the copy went around %d times; the content guard is not holding", total)
 	}
 }
