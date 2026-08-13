@@ -25,7 +25,7 @@ contents over an encrypted connection. They put it straight on their own
 clipboard.
 
 So: <kbd>⌘C</kbd> on the laptop, <kbd>Ctrl+V</kbd> on the desktop. That's the
-whole idea.
+whole idea — and it works for text, for images, and for files and folders.
 
 - **Fifteen words to set up.** `henri init` prints a recovery phrase; type it on
   your other devices. Those words *are* the group key — there is no server and
@@ -34,6 +34,11 @@ whole idea.
   under a key only your devices hold.
 - **Finds your devices by itself.** Machines on the same network discover each
   other. Anything else you list by address.
+- **Files and images travel too.** Copy a file, a folder or an image the way
+  you always do; paste it on the other machine. Files land in
+  `~/Downloads/henri` *and* on the clipboard as references, so
+  <kbd>Ctrl+V</kbd> in the file manager drops real files. Capped at 32 MiB
+  (`max_file_bytes`) — photos and documents, not films.
 - **Mixed groups work.** macOS, Linux and Windows devices all sit in the same
   group — the protocol is identical everywhere and text is normalised to UTF-8
   with `\n` line endings, so a copy on a Mac pastes unchanged on Linux, and
@@ -311,6 +316,21 @@ it currently considers in sync. A device claims that fingerprint *before* it
 writes an incoming payload, so its own watcher sees the new content as
 already-known and never bounces it back.
 
+**Files are content, not names.** A file copy travels as one encrypted gzip'd
+tar, sized before archiving so a folder of video is refused in milliseconds.
+The receiver unpacks it warily — no overwrites, no path escapes, no symlinks,
+decompression capped — and never trusts it: the archive arrived off the
+network, however well it authenticated. Because the receiver's paths can never
+match the sender's, files also carry a name-independent *content* fingerprint,
+which is what stops a copy echoing between devices the way byte-identity
+already stops text. A file copy is fingerprinted by path, size and modify
+time; edit deep inside a copied folder and henri may not notice — copy it
+again and it certainly will.
+
+**Images travel as PNG.** Whatever an app put on the clipboard — PNG, or the
+TIFF many macOS apps still use — it arrives as PNG pixels that paste straight
+into an editor on the other side.
+
 **The phrase is the secret.** `henri init` draws 160 bits from the system CSPRNG
 and renders them as fifteen words using [BIP-39](https://github.com/bitcoin/bips/blob/master/bip-0039/mnemonic.md),
 the same scheme cryptocurrency wallets use for seed phrases. The group's master
@@ -373,7 +393,8 @@ writes the file the link points at and leaves the link alone.
   "discovery": true,
   "peers": ["10.8.0.4:47600"],
   "poll_interval_ms": 400,
-  "max_payload_bytes": 4194304
+  "max_payload_bytes": 4194304,
+  "max_file_bytes": 33554432
 }
 ```
 
@@ -390,7 +411,9 @@ writes the file the link points at and leaves the link alone.
 | `peers` | `[]` | Devices to always push to — for anything off the LAN |
 | `poll_interval_ms` | `400` | How often the clipboard is checked, when no event source is available |
 | `clipboard_poll_only` | `false` | Ignore event sources and always poll |
-| `max_payload_bytes` | `4194304` | Clipboards larger than this are skipped |
+| `max_payload_bytes` | `4194304` | Text larger than this is skipped |
+| `max_file_bytes` | `33554432` | Files, folders and images larger than this are skipped; capped by what one frame can carry (~45 MiB) |
+| `receive_dir` | `~/Downloads/henri` | Where files copied on other devices land |
 | `hide_menu_bar_icon` | `false` | Turn off the macOS menu bar icon |
 
 Devices that aren't on the same network — a VPS, or a laptop behind a different
@@ -797,7 +820,15 @@ Found a problem? Open an issue.
 
 ## Limitations
 
-- **Text only.** Images and files aren't synced yet.
+- **Files are capped, not streamed.** A payload is one encrypted frame, so
+  `max_file_bytes` tops out around 45 MiB. Photos, documents and folders of
+  either travel fine; films and disk images want a syncthing, not a clipboard.
+- **Everyone upgrades together for files and images.** They travel as protocol
+  v2, which an old henri refuses whole — deliberately, since the alternative
+  is pasting a tar archive into a document as text. Text keeps syncing with
+  old devices either way.
+- **On X11, files and images need `xclip`.** `xsel` cannot name a target and
+  stays text-only; henri prefers `xclip` when both are installed.
 - **Polling is still the fallback.** With no event source henri checks every
   400ms, which works everywhere but spawns a helper process each time.
 - **Two daemons on one machine won't discover each other.** They share a
@@ -848,6 +879,7 @@ internal/service     launchd and systemd integration
 internal/hotkey      the send-highlighted key binding
 internal/firewall    firewall detection for `henri doctor`
 internal/tray        the macOS menu bar icon
+internal/pack        file and folder payloads: archive, and unpack warily
 assets/              the panel image at the top of this README
 ```
 
