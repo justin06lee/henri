@@ -355,6 +355,20 @@ var run = func(name string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
+// virtualInterface reports whether a name belongs to a container or VM bridge
+// rather than a network a peer could be on. They sit on private subnets too,
+// and on a machine running Docker they often enumerate first -- so without
+// this, generated rules ended up scoped to 172.17.0.0/16 and the doctor's
+// self-reachability probe dialled a bridge no peer will ever arrive from.
+func virtualInterface(name string) bool {
+	for _, p := range []string{"docker", "virbr", "veth", "br-", "vmnet", "vboxnet", "cni", "podman", "flannel"} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // LocalNetwork returns the CIDR of the network this machine is on, so generated
 // rules can be scoped to it. It returns "" when there is no obvious answer,
 // which the callers treat as "do not scope".
@@ -364,7 +378,7 @@ func LocalNetwork() string {
 		return ""
 	}
 	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 || virtualInterface(ifi.Name) {
 			continue
 		}
 		addrs, err := ifi.Addrs()
@@ -394,7 +408,7 @@ func LocalAddress() string {
 		return ""
 	}
 	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 || virtualInterface(ifi.Name) {
 			continue
 		}
 		addrs, err := ifi.Addrs()

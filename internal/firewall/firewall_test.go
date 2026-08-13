@@ -264,3 +264,18 @@ func TestMacOSEnabledWithoutBlockAllIsOpen(t *testing.T) {
 		t.Fatalf("an enabled firewall without block-all read as %+v", st)
 	}
 }
+
+func TestVirtualInterfacesAreNotTheLan(t *testing.T) {
+	virtual := []string{"docker0", "virbr0", "veth1a2b3c", "br-8f2d1e", "vmnet8", "vboxnet0", "cni0", "podman1", "flannel.1"}
+	for _, name := range virtual {
+		if !virtualInterface(name) {
+			t.Errorf("%s should be skipped as a container or VM bridge", name)
+		}
+	}
+	real := []string{"en0", "eth0", "wlan0", "wlp3s0", "enp0s31f6", "utun3", "tailscale0", "bridge0"}
+	for _, name := range real {
+		if virtualInterface(name) {
+			t.Errorf("%s is a network peers can be on, and was skipped", name)
+		}
+	}
+}
