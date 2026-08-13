@@ -346,6 +346,12 @@ func Write(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if t.trimCRLF {
+		// The mirror of the normalisation in Read: text in the group travels
+		// with \n, and pasting that into a CRLF-expecting Windows app used to
+		// land as a single line.
+		data = toCRLF(data)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -355,6 +361,13 @@ func Write(data []byte) error {
 		return fmt.Errorf("clipboard: write via %s: %w", t.name, err)
 	}
 	return nil
+}
+
+// toCRLF renders every line ending as \r\n, leaving endings that already are
+// alone rather than doubling them.
+func toCRLF(b []byte) []byte {
+	b = bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(b, []byte("\n"), []byte("\r\n"))
 }
 
 // writeWith feeds data to cmd's stdin and waits for it.
