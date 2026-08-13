@@ -62,7 +62,11 @@ func query(cfg *config.Config, kind string, primary bool) (*Message, error) {
 	if err := writeFrame(conn, box, req); err != nil {
 		return nil, err
 	}
-	resp, _, err := readFrame(conn, box, frameLimit(cfg.MaxBytes))
+	limit := cfg.MaxBytes
+	if cfg.MaxFileBytes > limit {
+		limit = cfg.MaxFileBytes
+	}
+	resp, _, err := readFrame(conn, box, frameLimit(limit))
 	if err != nil {
 		return nil, err
 	}

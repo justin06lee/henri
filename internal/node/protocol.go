@@ -97,8 +97,10 @@ type Message struct {
 	// Format says what Data is: text when empty, or one of the Format
 	// constants. Names are the file names inside a files payload, so the
 	// receiver can log and show what arrived without opening the archive.
+	// Count rides on a push ack so `henri send` can say how many went.
 	Format string   `json:"format,omitempty"`
 	Names  []string `json:"names,omitempty"`
+	Count  int      `json:"count,omitempty"`
 
 	// Replies.
 	State *State `json:"state,omitempty"`
@@ -131,8 +133,8 @@ type State struct {
 	// or a format constant, with LastCount the number of files it carried.
 	LastFormat string `json:"last_format,omitempty"`
 	LastCount  int    `json:"last_count,omitempty"`
-	Sent      int64  `json:"sent"`
-	Received  int64  `json:"received"`
+	Sent       int64  `json:"sent"`
+	Received   int64  `json:"received"`
 	// Beacons counts the discovery beacons heard from other devices, and
 	// LastBeaconAt is when the most recent one arrived. A daemon that has been
 	// up for hours with no beacons is deaf, however healthy it otherwise looks.

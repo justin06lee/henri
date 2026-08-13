@@ -62,10 +62,21 @@ func TestReadFrameRejectsEmptyFrame(t *testing.T) {
 	}
 }
 
-func TestReadFrameRejectsOtherProtocolVersion(t *testing.T) {
+func TestReadFrameSpeaksBothVersionsAndNoOthers(t *testing.T) {
 	box := testBox(t)
+	// v1 (text, and every older device) and v2 (files and images) both pass;
+	// anything else is refused whole.
+	for _, v := range []int{ProtocolVersion, ProtocolVersionRich} {
+		var buf bytes.Buffer
+		if err := writeFrame(&buf, box, &Message{V: v, Kind: KindAck}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := readFrame(&buf, box, frameLimit(1<<20)); err != nil {
+			t.Fatalf("protocol v%d was refused: %v", v, err)
+		}
+	}
 	var buf bytes.Buffer
-	if err := writeFrame(&buf, box, &Message{V: ProtocolVersion + 1, Kind: KindAck}); err != nil {
+	if err := writeFrame(&buf, box, &Message{V: ProtocolVersionRich + 1, Kind: KindAck}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := readFrame(&buf, box, frameLimit(1<<20)); err == nil {
