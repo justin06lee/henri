@@ -36,7 +36,8 @@ whole idea.
   other. Anything else you list by address.
 - **Mixed groups work.** macOS, Linux and Windows devices all sit in the same
   group — the protocol is identical everywhere and text is normalised to UTF-8
-  with `\n` line endings, so a copy on a Mac pastes unchanged on Linux.
+  with `\n` line endings, so a copy on a Mac pastes unchanged on Linux, and
+  gets its `\r\n` back when it lands on Windows.
 - **Starts at login.** `henri service install` sets it up as a launchd agent or
   a systemd user unit and gets out of the way.
 - **One static binary, no dependencies.** Nothing outside the Go standard
@@ -836,7 +837,9 @@ internal/secure      HKDF key derivation and AES-256-GCM
 internal/clipboard   per-platform clipboard access
 internal/node        the daemon: watcher, peers, discovery, protocol
 internal/service     launchd and systemd integration
-assets/              the panel image, used for the README and the tray icon
+internal/hotkey      the send-highlighted key binding
+internal/firewall    firewall detection for `henri doctor`
+assets/              the panel image at the top of this README
 ```
 
 ---
@@ -845,8 +848,7 @@ assets/              the panel image, used for the README and the tray icon
 
 Named after Henri from **Kindergarten WARS** — a manga by You Chiba, serialized
 on Shōnen Jump+ since 2022, about a kindergarten staffed by retired
-assassins. The image at the top is traced from a panel of him, and the same
-panel is what henri uses for its taskbar icon.
+assassins. The image at the top is traced from a panel of him.
 
 No affiliation with the author or Shueisha. The artwork belongs to them — it's
 here because I like the manga.

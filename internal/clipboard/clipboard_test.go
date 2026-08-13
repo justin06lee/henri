@@ -333,3 +333,20 @@ func TestResolveRefreshesWhenTheSessionAppears(t *testing.T) {
 		t.Fatalf("the Wayland session appeared and resolve still says %q", second.name)
 	}
 }
+
+// Text in the group travels with \n; the Windows backend has to restore \r\n
+// on the way out, without doubling endings that somehow already are.
+func TestToCRLFRestoresWindowsLineEndings(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"one line", "one line"},
+		{"two\nlines", "two\r\nlines"},
+		{"already\r\ndone", "already\r\ndone"},
+		{"mixed\nand\r\nmatched\n", "mixed\r\nand\r\nmatched\r\n"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := string(toCRLF([]byte(tc.in))); got != tc.want {
+			t.Errorf("toCRLF(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

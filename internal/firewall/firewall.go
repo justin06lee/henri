@@ -127,13 +127,16 @@ func detectFirewalld(tcpPort, udpPort int, lan string) (Status, bool) {
 		return Status{}, false
 	}
 	st := Status{Name: "firewalld", NeedsRoot: true}
-	state, err := run("firewall-cmd", "--state")
-	if err != nil && !strings.Contains(state, "running") {
-		// Installed but not running blocks nothing.
-		return Status{Name: "firewalld", Active: false}, true
-	}
-	st.Active = strings.Contains(state, "running")
+	state, _ := run("firewall-cmd", "--state")
+	// Not strings.Contains: a stopped firewalld says "not running", which
+	// contains "running", and for a while that read as an active firewall with
+	// unreadable rules -- ending the search before the firewall actually
+	// filtering (usually nftables) was ever looked at. Matching whole lines
+	// also survives the deprecation warnings firewall-cmd sometimes prints
+	// first.
+	st.Active = saysRunning(state)
 	if !st.Active {
+		// Installed but not running blocks nothing.
 		return st, true
 	}
 
@@ -152,6 +155,18 @@ func detectFirewalld(tcpPort, udpPort int, lan string) (Status, bool) {
 		st.OpenCmds = firewalldCmds(tcpPort, udpPort, lan)
 	}
 	return st, true
+}
+
+// saysRunning reports whether firewall-cmd's output says the daemon is
+// running. It answers "running" or "not running" on a line of its own,
+// occasionally after a warning line.
+func saysRunning(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "running" {
+			return true
+		}
+	}
+	return false
 }
 
 func firewalldCmds(tcpPort, udpPort int, lan string) [][]string {
@@ -278,11 +293,21 @@ func detectMacOS() Status {
 	if err != nil {
 		return Status{}
 	}
-	st := Status{Name: "macOS application firewall", Active: strings.Contains(out, "State = 1")}
+	// State = 1 is on; State = 2 is on with "Block all incoming connections",
+	// which for a while was read as the firewall being off -- reporting all
+	// clear in exactly the one state this check exists to catch.
+	blockAll := strings.Contains(out, "State = 2")
+	st := Status{Name: "macOS application firewall", Active: blockAll || strings.Contains(out, "State = 1")}
 	if !st.Active {
 		return st
 	}
-	if blockAll, err := run(fw, "--getblockall"); err == nil && strings.Contains(blockAll, "set to enabled") {
+	if !blockAll {
+		// Belt and braces: ask directly too, in case a build reports block-all
+		// through this call rather than through the global state.
+		got, err := run(fw, "--getblockall")
+		blockAll = err == nil && strings.Contains(got, "set to enabled")
+	}
+	if blockAll {
 		st.TCP, st.UDP = Blocked, Blocked
 		st.Note = "\"Block all incoming connections\" is on, which stops henri receiving anything; " +
 			"turn it off in System Settings > Network > Firewall"
@@ -315,16 +340,33 @@ func verdictFor(out string, port int, proto string) Verdict {
 	return Unknown
 }
 
-func have(bin string) bool {
+// have and run are variables so tests can hand the detectors the exact output
+// the real tools produce. The detectors are string-matching on prose, and
+// prose is where the bugs live: "not running" contains "running".
+var have = func(bin string) bool {
 	_, err := exec.LookPath(bin)
 	return err == nil
 }
 
-func run(name string, args ...string) (string, error) {
+var run = func(name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+// virtualInterface reports whether a name belongs to a container or VM bridge
+// rather than a network a peer could be on. They sit on private subnets too,
+// and on a machine running Docker they often enumerate first -- so without
+// this, generated rules ended up scoped to 172.17.0.0/16 and the doctor's
+// self-reachability probe dialled a bridge no peer will ever arrive from.
+func virtualInterface(name string) bool {
+	for _, p := range []string{"docker", "virbr", "veth", "br-", "vmnet", "vboxnet", "cni", "podman", "flannel"} {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // LocalNetwork returns the CIDR of the network this machine is on, so generated
@@ -336,7 +378,7 @@ func LocalNetwork() string {
 		return ""
 	}
 	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 || virtualInterface(ifi.Name) {
 			continue
 		}
 		addrs, err := ifi.Addrs()
@@ -366,7 +408,7 @@ func LocalAddress() string {
 		return ""
 	}
 	for _, ifi := range ifaces {
-		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
+		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 || virtualInterface(ifi.Name) {
 			continue
 		}
 		addrs, err := ifi.Addrs()

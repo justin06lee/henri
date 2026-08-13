@@ -518,6 +518,14 @@ func cmdDaemon(args []string) error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
+	// The tamper check on group_id and key exists only when there is a phrase
+	// to re-derive them from. A config without one -- made by an old henri, or
+	// stripped of the field by whoever swapped the key -- runs unverified, and
+	// that should at least be said out loud.
+	if cfg.Phrase == "" {
+		log.Warn("config has no recovery phrase; henri cannot verify that its group and key still belong together")
+	}
+
 	n, err := node.New(cfg, log)
 	if err != nil {
 		return err
@@ -746,6 +754,17 @@ func cmdDoctor(args []string) error {
 
 	var problems []string
 
+	// The tamper check on group_id and key exists only when there is a phrase
+	// to re-derive them from; without one the config runs unverified, and the
+	// place to say so is the command whose whole job is saying what is wrong.
+	if cfg.Phrase == "" {
+		fmt.Printf("  ⚠ config     has no recovery phrase, so henri cannot check that its group\n")
+		fmt.Printf("               and key still belong together\n")
+		problems = append(problems, "This config predates recovery phrases, or the phrase was removed. To\n"+
+			"     move the group to a phrase, run `henri init` on one device and\n"+
+			"     `henri join` on the others.")
+	}
+
 	// The clipboard first: without it nothing else matters, and it is the one
 	// piece that fails differently under a service than it does in a terminal.
 	if err := clipboard.Available(); err != nil {
@@ -839,29 +858,49 @@ func cmdDoctor(args []string) error {
 
 	// And finally the peers, one connection each. This is the check that would
 	// have named the problem straight away.
-	if st != nil {
+	type peerTarget struct{ name, addr string }
+	var targets []peerTarget
+	switch {
+	case st != nil:
 		fmt.Println()
 		if len(st.Peers) == 0 {
 			fmt.Printf("  no peers known yet\n")
 		}
 		for _, p := range st.Peers {
-			// A peer added by address has no name until it answers, and
-			// printing the address in both columns just looks broken.
-			name := safe(p.Name, maxName)
-			if name == "" {
-				name = "—"
-			}
-			ok, reason := firewall.Reach(p.Addr, reachTimeout)
-			if ok {
-				fmt.Printf("  ✓ %-16s %s\n", name, safe(p.Addr, maxAddr))
-				continue
-			}
-			fmt.Printf("  ✗ %-16s %s\n", name, safe(p.Addr, maxAddr))
-			fmt.Printf("    %s\n", reason)
-			problems = append(problems, fmt.Sprintf("henri on %s cannot be reached. That is a firewall on THAT machine,\n"+
-				"     not this one — open tcp/%d and udp/%d there. `henri doctor -fix` on\n"+
-				"     that device will do it.", name, cfg.ListenPort, cfg.DiscoveryPort))
+			targets = append(targets, peerTarget{p.Name, p.Addr})
 		}
+	case len(cfg.Peers) > 0:
+		// The daemon being down does not make the configured peers untestable,
+		// and "is that machine reachable at all" is exactly the question a
+		// broken setup needs answered. Discovered peers live in the daemon, so
+		// those really are unknown until it is back.
+		fmt.Println()
+		fmt.Printf("  peers from the config (discovered peers are unknown while the daemon is stopped)\n")
+		for _, addr := range cfg.Peers {
+			targets = append(targets, peerTarget{"", addr})
+		}
+	}
+	for _, p := range targets {
+		// A peer added by address has no name until it answers, and
+		// printing the address in both columns just looks broken.
+		name := safe(p.name, maxName)
+		if name == "" {
+			name = "—"
+		}
+		ok, reason := firewall.Reach(p.addr, reachTimeout)
+		if ok {
+			fmt.Printf("  ✓ %-16s %s\n", name, safe(p.addr, maxAddr))
+			continue
+		}
+		fmt.Printf("  ✗ %-16s %s\n", name, safe(p.addr, maxAddr))
+		fmt.Printf("    %s\n", reason)
+		who := name
+		if who == "—" {
+			who = safe(p.addr, maxAddr)
+		}
+		problems = append(problems, fmt.Sprintf("henri on %s cannot be reached. That is a firewall on THAT machine,\n"+
+			"     not this one — open tcp/%d and udp/%d there. `henri doctor -fix` on\n"+
+			"     that device will do it.", who, cfg.ListenPort, cfg.DiscoveryPort))
 	}
 
 	if len(problems) == 0 && !fw.Blocking() {

@@ -325,18 +325,23 @@ func (n *Node) handleBeacon(sealed []byte, src *net.UDPAddr) {
 	if msg.V != ProtocolVersion || msg.Kind != KindHello {
 		return
 	}
-	// Anything that decrypts is proof the membership is alive, including this
-	// device's own beacon coming back: that is what keeps a device alone on the
-	// network from declaring itself deaf every forty seconds.
+	if err := checkFresh(msg.TS); err != nil {
+		// Checked before the beacon counts as "heard". A stale beacon proves
+		// nothing about the membership being alive -- it can be a capture
+		// replayed at this device, and counting it used to let exactly that
+		// keep resetting the deafness timer that would have re-joined the
+		// group.
+		n.log.Debug("stale beacon", "from", displayName(&msg), "err", err)
+		return
+	}
+	// Anything fresh that decrypts is proof the membership is alive, including
+	// this device's own beacon coming back: that is what keeps a device alone
+	// on the network from declaring itself deaf every forty seconds.
 	n.heard.Store(time.Now().UnixMilli())
 	n.deafWarned.Store(false)
 
 	if msg.Device == n.cfg.DeviceID {
 		return // our own beacon, echoed back by the network
-	}
-	if err := checkFresh(msg.TS); err != nil {
-		n.log.Debug("stale beacon", "from", displayName(&msg), "err", err)
-		return
 	}
 	if msg.Port <= 0 || msg.Port > 65535 {
 		return
