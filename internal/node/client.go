@@ -12,7 +12,11 @@ import (
 )
 
 // ErrNotRunning means nothing is listening on the daemon's port locally.
-var ErrNotRunning = errors.New("henri: the daemon is not running (start it with `henri daemon`)")
+//
+// No "henri: " in the text: main() adds that prefix to whatever error reaches
+// it, and commands that let this one through unhandled -- `henri send` -- were
+// printing "henri: henri: the daemon is not running".
+var ErrNotRunning = errors.New("the daemon is not running (start it with `henri daemon`)")
 
 // Query sends a control message to the daemon on this machine and returns the
 // reply. It reuses the group key, so a process that cannot read the config

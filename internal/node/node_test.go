@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -417,6 +418,11 @@ func TestQueryReportsDaemonNotRunning(t *testing.T) {
 	}
 	if _, err := Query(cfg, KindStatus); err != ErrNotRunning {
 		t.Fatalf("got %v, want ErrNotRunning", err)
+	}
+	// main() prefixes every error it prints with "henri: ", so the sentinel
+	// must not carry its own -- `henri send` printed "henri: henri: ...".
+	if strings.HasPrefix(ErrNotRunning.Error(), "henri:") {
+		t.Fatalf("ErrNotRunning carries its own prefix: %q", ErrNotRunning)
 	}
 }
 
