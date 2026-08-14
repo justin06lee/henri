@@ -82,6 +82,19 @@ To skip root altogether, install somewhere you own:
 make install PREFIX=$HOME/.local    # ~/.local/bin/henri
 ```
 
+Already running henri and pulled a newer version? One command does the whole
+upgrade:
+
+```sh
+make update
+```
+
+It stops the background service, sweeps stale copies out of the usual install
+locations (`~/.local/bin`, `$(go env GOPATH)/bin`), installs the fresh build
+where `make install` would, and brings the service back — but only if one was
+installed to begin with. Run it as yourself, never under `sudo`: it asks for
+root by itself, for the one step that needs it.
+
 **Linux** additionally needs a clipboard helper — `wl-clipboard` on Wayland, or
 `xclip`/`xsel` on X11:
 
@@ -563,8 +576,9 @@ belongs to that session, so a system-wide daemon could not reach it.
 
 ### After upgrading henri, re-run `henri service install`
 
-It is idempotent, and nothing else rewrites the unit file — so an existing
-install keeps whatever was written the first time, bugs included.
+`make update` does this for you. By hand, the point is: `henri service
+install` is idempotent, and nothing else rewrites the unit file — so an
+existing install keeps whatever was written the first time, bugs included.
 
 - **macOS.** launchd hands a job an environment with no locale at all, and
   `pbcopy`/`pbpaste` take their text encoding from `LANG`, falling back to plain
