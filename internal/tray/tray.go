@@ -28,12 +28,15 @@ import (
 //go:embed tray.js
 var script []byte
 
-// icon is Henri's eye, redrawn as a few bold shapes. The README panel it
-// comes from is fine line art, and at eighteen points fine lines render as
-// grey mist next to the solid glyphs a menu bar is full of -- the first
-// version of this icon was invisible in exactly that way. A template image is
-// drawn from its alpha channel alone, so the mark is opaque shapes on a
-// transparent background and nothing else.
+// icon is the whole README panel, with two changes that keep it visible. Its
+// white background is gone: a template image is drawn from the alpha channel
+// alone, and an opaque background renders as a solid square. And every path
+// carries a thick round-joined stroke on top of its fill, which dilates the
+// fine traced line art uniformly -- at eighteen points, hairlines render as
+// grey mist next to the solid glyphs a menu bar is full of, and the first
+// version of this icon was invisible in exactly that way. The frame is
+// thickened to match, so the icon holds a solid footprint even where the art
+// inside is sparse.
 //
 //go:embed icon.svg
 var icon []byte
