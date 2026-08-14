@@ -56,7 +56,12 @@ function run(argv) {
   );
   const img = $.NSImage.alloc.initWithContentsOfFile(iconPath);
   if (!img.isNil()) {
-    img.size = $.NSMakeSize(18, 18);
+    // Fill the bar's height and keep the art's shape: forcing a wide panel
+    // into a square box shrinks the figure to make room for empty corners.
+    const h = 20;
+    const natural = img.size;
+    const w = natural.height > 0 ? (natural.width / natural.height) * h : h;
+    img.size = $.NSMakeSize(w, h);
     // A template image draws from its alpha channel and follows the menu
     // bar's light and dark modes; the icon file has no background for
     // exactly this reason.
