@@ -34,18 +34,14 @@ func TestCommandPassesTheContractInOrder(t *testing.T) {
 }
 
 // A template image is drawn from its alpha channel, so an opaque background
-// renders as a solid square, and hairline art renders as invisible mist. The
-// embedded icon is the README panel with the background dropped and the line
-// work dilated by a heavy stroke; this keeps both properties in place.
-func TestIconIsThickenedTransparentArt(t *testing.T) {
+// renders as a solid square. The embedded icon is the README panel minus its
+// white backing; this is the check that keeps it that way.
+func TestIconIsTransparentPanelArt(t *testing.T) {
 	if !bytes.Contains(icon, []byte("<svg")) {
 		t.Fatal("the embedded icon is not an SVG")
 	}
 	if bytes.Contains(icon, []byte(`<rect width="512" height="512" fill="#ffffff"/>`)) {
 		t.Fatal("the embedded icon has an opaque background and would render as a solid square")
-	}
-	if !bytes.Contains(icon, []byte(`stroke-width="200"`)) {
-		t.Fatal("the art lost its thickening stroke; hairline art is invisible at menu bar size")
 	}
 }
 

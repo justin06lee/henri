@@ -28,15 +28,12 @@ import (
 //go:embed tray.js
 var script []byte
 
-// icon is the whole README panel, with two changes that keep it visible. Its
-// white background is gone: a template image is drawn from the alpha channel
-// alone, and an opaque background renders as a solid square. And every path
-// carries a thick round-joined stroke on top of its fill, which dilates the
-// fine traced line art uniformly -- at eighteen points, hairlines render as
-// grey mist next to the solid glyphs a menu bar is full of, and the first
-// version of this icon was invisible in exactly that way. The frame is
-// thickened to match, so the icon holds a solid footprint even where the art
-// inside is sparse.
+// icon is the panel art from the README with its white background removed: a
+// menu bar item is a template image drawn from the alpha channel, and an
+// opaque background renders as a solid square. The fine line art renders
+// lighter than the solid glyphs around it, which is the trade its owner
+// picked, with open eyes, over a thickened or simplified version: it is the
+// panel or nothing.
 //
 //go:embed icon.svg
 var icon []byte
