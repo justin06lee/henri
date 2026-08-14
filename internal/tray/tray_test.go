@@ -44,7 +44,7 @@ func TestIconIsThickenedTransparentArt(t *testing.T) {
 	if bytes.Contains(icon, []byte(`<rect width="512" height="512" fill="#ffffff"/>`)) {
 		t.Fatal("the embedded icon has an opaque background and would render as a solid square")
 	}
-	if !bytes.Contains(icon, []byte(`stroke-width="240"`)) {
+	if !bytes.Contains(icon, []byte(`stroke-width="200"`)) {
 		t.Fatal("the art lost its thickening stroke; hairline art is invisible at menu bar size")
 	}
 }
