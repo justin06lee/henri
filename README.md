@@ -889,8 +889,9 @@ assets/              the panel image at the top of this README
 
 Named after Henri from **Kindergarten WARS** — a manga by You Chiba, serialized
 on Shōnen Jump+ since 2022, about a kindergarten staffed by retired
-assassins. The image at the top is traced from a panel of him, and the same
-panel sits in the macOS menu bar while henri runs.
+assassins. The image at the top is traced from a panel of him — a close-up of
+his eye — and that eye, redrawn as a few bold strokes so it survives sixteen
+pixels, is what sits in the macOS menu bar while henri runs.
 
 How it gets there is henri all over: a menu bar item needs AppKit, AppKit
 needs cgo, and henri does not take cgo — but macOS ships `osascript`, whose

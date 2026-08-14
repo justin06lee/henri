@@ -34,14 +34,17 @@ func TestCommandPassesTheContractInOrder(t *testing.T) {
 }
 
 // A template image is drawn from its alpha channel, so an opaque background
-// renders as a solid square. The embedded icon is the README panel minus its
-// white backing; this is the check that keeps it that way.
-func TestIconIsTransparentLineArt(t *testing.T) {
+// renders as a solid square and pale fills render as mist. The embedded icon
+// is a few bold black shapes on transparency; this keeps it that way.
+func TestIconIsBoldTransparentShapes(t *testing.T) {
 	if !bytes.Contains(icon, []byte("<svg")) {
 		t.Fatal("the embedded icon is not an SVG")
 	}
-	if bytes.Contains(icon, []byte(`<rect width="512" height="512" fill="#ffffff"/>`)) {
+	if bytes.Contains(icon, []byte(`fill="#ffffff"`)) || bytes.Contains(icon, []byte("<rect")) {
 		t.Fatal("the embedded icon has an opaque background and would render as a solid square")
+	}
+	if !bytes.Contains(icon, []byte(`fill="#000"`)) {
+		t.Fatal("the embedded icon has no solid shapes; thin line art is invisible at menu bar size")
 	}
 }
 
