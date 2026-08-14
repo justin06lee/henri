@@ -28,9 +28,12 @@ import (
 //go:embed tray.js
 var script []byte
 
-// icon is the panel art from the README with its white background removed: a
-// menu bar item is a template image drawn from the alpha channel, and an
-// opaque background renders as a solid square.
+// icon is Henri's eye, redrawn as a few bold shapes. The README panel it
+// comes from is fine line art, and at eighteen points fine lines render as
+// grey mist next to the solid glyphs a menu bar is full of -- the first
+// version of this icon was invisible in exactly that way. A template image is
+// drawn from its alpha channel alone, so the mark is opaque shapes on a
+// transparent background and nothing else.
 //
 //go:embed icon.svg
 var icon []byte
