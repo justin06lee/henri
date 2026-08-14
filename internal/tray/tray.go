@@ -28,12 +28,13 @@ import (
 //go:embed tray.js
 var script []byte
 
-// icon is the panel art from the README with its white background removed: a
-// menu bar item is a template image drawn from the alpha channel, and an
-// opaque background renders as a solid square. The fine line art renders
-// lighter than the solid glyphs around it, which is the trade its owner
-// picked, with open eyes, over a thickened or simplified version: it is the
-// panel or nothing.
+// icon is a second panel of Henri -- head bowed, hair over his face -- traced
+// from the manga with mkbitmap and potrace, the same way the README's panel
+// was, and with no background: a menu bar item is a template image drawn from
+// the alpha channel, and an opaque background renders as a solid square. The
+// fine line art renders lighter than the solid glyphs around it, which is the
+// trade its owner picked, with open eyes, over a thickened or simplified
+// version: it is the art or nothing.
 //
 //go:embed icon.svg
 var icon []byte
