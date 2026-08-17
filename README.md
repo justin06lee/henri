@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/henri-panel.svg" alt="henri" width="240">
+  <img src="assets/henri-panel.svg" alt="henri" width="248">
 </p>
 
 <h1 align="center">henri</h1>

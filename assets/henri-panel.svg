@@ -1,7 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="t">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 528 528" width="528" height="528" role="img" aria-labelledby="t">
 <title id="t">henri</title>
 <defs><clipPath id="panel"><rect x="4" y="4" width="504" height="504"/></clipPath></defs>
-<rect width="512" height="512" fill="#ffffff"/>
+<rect width="528" height="528" fill="#ffffff"/>
+<g transform="translate(8,8)">
 <g clip-path="url(#panel)">
 <g transform="translate(0,-10.2400) scale(0.682667)">
 <g transform="translate(0.000000,780.000000) scale(0.100000,-0.100000)"
@@ -1316,4 +1317,5 @@ m-520 -5476 c19 -16 22 -22 12 -32 -18 -18 -16 -29 5 -29 54 -1 50 -38 -9 -69
 </g>
 </g>
 <rect x="2" y="2" width="508" height="508" fill="none" stroke="#0a0a0a" stroke-width="4"/>
+</g>
 </svg>
